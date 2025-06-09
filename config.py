@@ -1,27 +1,36 @@
+# config.py
 import os
+import re
+from pathlib import Path
 from multiplex_pipeline.preprocessing.segmentation import post_process_mask, post_process_mask_closing
 
 # User information
 CNIO_USER = "jgagullo"
 
 # Server base paths
-BASE_SERVER_PATH = r"\\imgserver.cnio.es\IMAGES\CONFOCAL\IA\Projects\2024\2024_10_21_jgagullo\spatial analisis\qpath"
-DATA_FOLDER = os.path.join(BASE_SERVER_PATH, "data", CNIO_USER)
-EXPORT_DAPI_FOLDER = os.path.join(BASE_SERVER_PATH, "qpathprojects", CNIO_USER, "export_DAPI")
-EXPORTED_MASKS_FOLDER = os.path.join(BASE_SERVER_PATH, "qpathprojects", CNIO_USER, "exportedmasks")
+BASE_SERVER_PATH = Path(r"\\imgserver.cnio.es\IMAGES\CONFOCAL\IA\Projects\2024\2024_10_21_jgagullo\spatial analisis\qpath")
+DATA_FOLDER = BASE_SERVER_PATH / "data" / CNIO_USER
+EXPORT_DAPI_FOLDER = BASE_SERVER_PATH / "qpathprojects" / CNIO_USER / "export_DAPI"
+EXPORTED_MASKS_FOLDER = BASE_SERVER_PATH / "qpathprojects" / CNIO_USER / "exportedmasks"
 
-# Results directories
-RESULTS_BASE_DIR = os.path.join("..", "results_spatial_analysis", CNIO_USER)
-CELL_COUNT_OUTPUT_DIR = os.path.join(RESULTS_BASE_DIR, "cell_counting")
-CELL_DENSITY_OUTPUT_DIR = os.path.join(RESULTS_BASE_DIR, "cell_density_area")
-BOXPLOTS_DISTANCES_DIR = os.path.join(RESULTS_BASE_DIR, "boxplots_distances_to_mask")
-DISTANCES_SUBPOP_DIR = os.path.join(RESULTS_BASE_DIR, "distances_between_mask_and_subpopulation")
-DISTANCES_POPULATIONS_DIR = os.path.join(RESULTS_BASE_DIR, "distances_between_populations")
+# File patterns
+IMAGE_EXTENSIONS = [".ome.tiff", ".tiff", ".tif"]
+DAPI_PATTERN = re.compile(r"roi(\d+)_dapi", re.IGNORECASE)
+CSV_EXTENSION = ".csv"
+
+# Results directories (padre, sin usuario)
+RESULTS_BASE_DIR         = Path(".") / "results_spatial_analysis"
+CELL_COUNT_OUTPUT_DIR    = RESULTS_BASE_DIR / CNIO_USER / "cell_counting"
+CELL_DENSITY_OUTPUT_DIR  = RESULTS_BASE_DIR / CNIO_USER / "cell_density_area"
+BOXPLOTS_DISTANCES_DIR   = RESULTS_BASE_DIR / CNIO_USER / "boxplots_distances_to_mask"
+BOXPLOTS_DISTANCES_HEATMAPS_DIR   = RESULTS_BASE_DIR / CNIO_USER / "boxplots_distances_between_populations"
+DISTANCES_SUBPOP_DIR     = RESULTS_BASE_DIR / CNIO_USER / "distances_between_mask_and_subpopulation"
+DISTANCES_POPULATIONS_DIR= RESULTS_BASE_DIR / CNIO_USER / "distances_between_populations"
 
 # Imaging constants
-PIXEL_SIZE = 0.17  # micrometers
-PIXEL_AREA = PIXEL_SIZE ** 2  # µm²
-MASK_ALPHA = 0.5
+PIXEL_SIZE       = 0.17  # micrometers
+PIXEL_AREA       = PIXEL_SIZE ** 2  # µm²
+MASK_ALPHA       = 0.5
 DEFAULT_BRIGHTNESS = 10
 
 # Channels and markers
@@ -70,7 +79,7 @@ NGFR_SETTINGS = {
     "user_scores": {
         'ROI1.ome.tiff': 2.7, 'ROI2.ome.tiff': 2.7, 'ROI3.ome.tiff': 2.7,
         'ROI4.ome.tiff': 1.8, 'ROI5.ome.tiff': 1.8, 'ROI6.ome.tiff': 1.8,
-        'ROI7.ome.tiff': 1.5, 'ROI8.ome.tiff': 1.2, 'ROI10.ome.tiff': 2.7,
+        'ROI7.ome.tiff': 1.5, 'ROI8.ome.tiff': 1.2,'ROI9.ome.tiff': 1.2, 'ROI10.ome.tiff': 2.7,
         'ROI11.ome.tiff': 2.4, 'ROI12.ome.tiff': 2.7, 'ROI13.ome.tiff': 2.1,
     },
     "scaling_divisor": 3,
@@ -101,7 +110,6 @@ INTENSITY_THRESHOLDS = {
     'mean_intensity_CD11c': 2,
     'mean_intensity_HLA_DR': 1.5,
 }
-
 
 
 CARACTERIZATION_COMBINATIONS = {
@@ -324,3 +332,9 @@ SHADING_COLORS = {
 
 # ROIs to analyze
 ROIS_TO_ANALYZE = ["roi1"]
+
+
+ #process_roi
+import re
+ROI_PATTERN       = re.compile(r"(ROI\d+)", re.IGNORECASE)
+DAPI_CONNECTIVITY = 1
