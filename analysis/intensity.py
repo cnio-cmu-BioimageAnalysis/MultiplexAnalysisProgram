@@ -1,187 +1,207 @@
-import re
 import numpy as np
 import pandas as pd
 from skimage import measure
+from tqdm import tqdm
+from typing import Dict, Optional
+
+from multiplex_pipeline.config import ROI_PATTERN, DAPI_CONNECTIVITY, PIXEL_AREA
 from multiplex_pipeline.utils.validation import verify_binary
 
-def process_roi(img_name, 
-               img_data, 
-               dapi_masks_dict, 
-               ck_masks_dict, 
-               ngfr_masks_dict, 
-               channels, 
-               marker_dict,
-               pixel_area_um2):
+
+def extract_roi_key(img_name: str) -> Optional[str]:
     """
-    Processes each ROI to generate a DataFrame with mean intensities,
-    binary values, area of each cell in micrometers squared,
-    and centroid coordinates in the image.
+    Extracts the ROI key (Region of Interest) from the image name.
+
+    Args:
+        img_name (str): The image file name.
+
+    Returns:
+        Optional[str]: The extracted ROI key from the image name, or None if not found.
     """
-    roi_match = re.search(r"(ROI\d+)", img_name, re.IGNORECASE)
-    if not roi_match:
-        print(f"ROI not found in image name: {img_name}")
-        return None
-    roi_key = roi_match.group(1).lower()  # Por ejemplo: "roi1"
+    m = ROI_PATTERN.search(img_name)
+    return m.group(1).lower() if m else None
 
-    dapi_key = roi_key + "_dapi"
-    ck_key   = roi_key
-    ngfr_key = roi_key
-    
-    if dapi_key not in dapi_masks_dict:
-        print(f"{dapi_key} not found in dapi_masks_dict.")
-        return None
 
-    mask_dapi = dapi_masks_dict[dapi_key]
-    if mask_dapi.shape != img_data.shape[1:]:
-        print(f"Dimensions do not match for {img_name}: {mask_dapi.shape} vs {img_data.shape[1:]}")
-        return None
+def label_dapi(mask: np.ndarray) -> np.ndarray:
+    """
+    Labels the DAPI mask, returning it if already labeled or labeling it if binary.
 
-    # Si la máscara DAPI está binaria, la etiquetamos
-    if len(np.unique(mask_dapi)) <= 2:
-        print(f"DAPI mask for {roi_key} is binary. Attempting to label.")
-        labeled_mask = measure.label(mask_dapi, connectivity=1)
-    else:
-        labeled_mask = mask_dapi
+    Args:
+        mask (np.ndarray): The binary DAPI mask.
 
-    # Contamos cuántos píxeles hay de cada etiqueta
-    mask_flat = labeled_mask.ravel()
-    counts = np.bincount(mask_flat)
+    Returns:
+        np.ndarray: The labeled mask.
+    """
+    if len(np.unique(mask)) <= 2:
+        return measure.label(mask, connectivity=DAPI_CONNECTIVITY)
+    return mask
+
+
+def get_labels_and_counts(labeled_mask: np.ndarray) -> tuple:
+    """
+    Retrieves labels and counts of regions in the labeled mask.
+
+    Args:
+        labeled_mask (np.ndarray): The labeled mask.
+
+    Returns:
+        tuple: A tuple with the labels, counts, and flattened mask.
+    """
+    flat = labeled_mask.ravel()
+    counts = np.bincount(flat)
     labels = np.arange(len(counts))
     valid = (labels != 0) & (counts > 0)
-    valid_labels = labels[valid]
+    return labels[valid], counts[valid], flat
 
-    # === NUEVO: calculamos centroides de cada label con regionprops ===
-    props = measure.regionprops(labeled_mask)
-    label_centroids = {p.label: p.centroid for p in props}
 
-    # Columnas base
+def get_centroids_map(labeled_mask: np.ndarray) -> Dict[int, tuple]:
+    """
+    Retrieves centroids of labeled regions in the mask.
+
+    Args:
+        labeled_mask (np.ndarray): The labeled mask.
+
+    Returns:
+        Dict[int, tuple]: A dictionary with the label as the key and the centroid as the value.
+    """
+    return {p.label: p.centroid for p in measure.regionprops(labeled_mask)}
+
+
+def compute_mean_intensities(mask_flat: np.ndarray, img_channel: np.ndarray, valid: np.ndarray, counts: np.ndarray) -> np.ndarray:
+    """
+    Computes the mean intensities for each region in the image channel.
+
+    Args:
+        mask_flat (np.ndarray): The flattened mask.
+        img_channel (np.ndarray): The image channel data for intensity computation.
+        valid (np.ndarray): Valid labels for regions.
+        counts (np.ndarray): Pixel counts for each region.
+
+    Returns:
+        np.ndarray: An array of mean intensities for each region.
+    """
+    sums = np.bincount(mask_flat, weights=img_channel.ravel())
+    return sums[valid] / counts
+
+
+def compute_binary_flags(valid_labels: np.ndarray, mask_flat: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Computes binary flags for valid labels in the mask.
+
+    Args:
+        valid_labels (np.ndarray): The valid labels.
+        mask_flat (np.ndarray): The flattened mask.
+        mask (np.ndarray): The binary mask to check against.
+
+    Returns:
+        np.ndarray: A binary array indicating if a label is present in the mask.
+    """
+    verify_binary(mask, "mask")
+    flat = mask.ravel()
+    positive = np.unique(mask_flat[flat > 0])
+    return np.isin(valid_labels, positive).astype(int)
+
+
+def process_roi(
+    img_name: str,
+    img_data: np.ndarray,
+    dapi_masks: Dict[str, np.ndarray],
+    ck_masks: Dict[str, np.ndarray],
+    ngfr_masks: Dict[str, np.ndarray],
+    channels: list,
+    marker_dict: Dict[str, str],
+    pixel_area_um2: float = PIXEL_AREA
+) -> Optional[pd.DataFrame]:
+    """
+    Processes the ROI of an image to compute intensity and binary flags for different channels.
+
+    Args:
+        img_name (str): The image name.
+        img_data (np.ndarray): The image data (channels).
+        dapi_masks (Dict[str, np.ndarray]): DAPI masks by ROI.
+        ck_masks (Dict[str, np.ndarray]): CK masks by ROI.
+        ngfr_masks (Dict[str, np.ndarray]): NGFR masks by ROI.
+        channels (list): List of channels to analyze.
+        marker_dict (Dict[str, str]): A dictionary of channel markers.
+        pixel_area_um2 (float, optional): The area in square micrometers per pixel. Default is PIXEL_AREA.
+
+    Returns:
+        Optional[pd.DataFrame]: A DataFrame with the ROI results, or None if an error occurs.
+    """
+    roi = extract_roi_key(img_name)
+    if roi is None:
+        print(f"ROI not found in '{img_name}'")
+        return None
+
+    dapi_key = f"{roi}_dapi"
+    if dapi_key not in dapi_masks:
+        print(f"{dapi_key} not found in dapi_masks")
+        return None
+
+    mask_dapi = dapi_masks[dapi_key]
+    if mask_dapi.shape != img_data.shape[1:]:
+        print(f"Dimensions do not match for {img_name}")
+        return None
+
+    lbl = label_dapi(mask_dapi)
+    valid_labels, counts, flat = get_labels_and_counts(lbl)
+    cent_map = get_centroids_map(lbl)
+
+    # Base DataFrame
     df = pd.DataFrame({
-        "ROI": [roi_key] * len(valid_labels),
+        "ROI": roi,
         "DAPI_ID": valid_labels,
-        "Area_pixels": counts[valid],
-        "Area_um2": counts[valid] * pixel_area_um2
+        "Area_pixels": counts,
+        "Area_um2": counts * pixel_area_um2,
+        "centroid_y": [cent_map.get(l, (np.nan,))[0] for l in valid_labels],
+        "centroid_x": [cent_map.get(l, (np.nan,))[1] for l in valid_labels],
     })
 
-    # Agregar columnas de centroides (y=row, x=col)
-    centroids_y = []
-    centroids_x = []
-    for lbl in valid_labels:
-        if lbl in label_centroids:
-            cy, cx = label_centroids[lbl]
+    # Intensities and flags for each channel
+    for ch in tqdm(channels, desc=f"Channels {roi}", unit="ch"):
+        name = marker_dict.get(ch, f"Ch{ch}")
+        col_base = name.replace(" ", "_").replace("-", "_").replace(">", "").replace("<", "")
+        img_ch = img_data[ch]
+
+        if "ngfr" in name.lower():
+            df[f"mean_intensity_{col_base}"] = compute_mean_intensities(flat, img_ch, valid_labels, counts)
+            mask_ng = ngfr_masks.get(roi, np.zeros_like(mask_dapi))
+            df[f"is_positive_{col_base}"] = compute_binary_flags(valid_labels, flat, mask_ng)
+
+        elif "ck" in name.lower():
+            mask_ck = ck_masks.get(roi, np.zeros_like(mask_dapi))
+            df[f"is_positive_{col_base}"] = compute_binary_flags(valid_labels, flat, mask_ck)
+
         else:
-            cy, cx = (np.nan, np.nan)
-        centroids_y.append(cy)
-        centroids_x.append(cx)
-
-    df["centroid_y"] = centroids_y
-    df["centroid_x"] = centroids_x
-
-    # --- Iterar a través de los canales de interés ---
-    for ch in channels:
-        marker = marker_dict.get(ch, f"Channel_{ch}")
-        marker_lower = marker.lower()
-
-        # Limpiamos el nombre del marcador para usarlo como columna
-        formatted_name = marker.replace(' ', '_').replace('-', '_').replace('>', '').replace('<', '')
-
-        # CASO A) NGFR: intensidad media + binario
-        if "ngfr" in marker_lower:
-            intensity_flat = img_data[ch].ravel()
-            sum_intensities = np.bincount(mask_flat, weights=intensity_flat)
-            means = sum_intensities[valid] / counts[valid]
-            df[f"mean_intensity_{formatted_name}"] = means
-
-            if ngfr_key in ngfr_masks_dict:
-                mask_ngfr = ngfr_masks_dict[ngfr_key]
-                verify_binary(mask_ngfr, f"NGFR mask for {roi_key}")
-
-                if mask_ngfr.shape != mask_dapi.shape:
-                    print(f"Dimensions of NGFR mask {ngfr_key} do not match DAPI mask: {mask_ngfr.shape} vs {mask_dapi.shape}")
-                    positive_flags = np.zeros(len(valid_labels), dtype=int)
-                else:
-                    mask_ngfr_flat = mask_ngfr.ravel()
-                    etiquetas_ngfr = mask_flat[mask_ngfr_flat > 0]
-                    positive_labels = np.unique(etiquetas_ngfr)
-                    positive_flags = np.isin(valid_labels, positive_labels).astype(int)
-            else:
-                print(f"NGFR mask not found for {roi_key}")
-                positive_flags = np.zeros(len(valid_labels), dtype=int)
-            
-            df[f"is_positive_{formatted_name}"] = positive_flags
-
-        # CASO B) CK: solo máscara binaria
-        elif "ck" in marker_lower:
-            if ck_key in ck_masks_dict:
-                mask_ck = ck_masks_dict[ck_key]
-                verify_binary(mask_ck, f"CK mask for {roi_key}")
-
-                if mask_ck.shape != mask_dapi.shape:
-                    print(f"Dimensions of CK mask {ck_key} do not match DAPI mask: {mask_ck.shape} vs {mask_dapi.shape}")
-                    positive_flags = np.zeros(len(valid_labels), dtype=int)
-                else:
-                    mask_ck_flat = mask_ck.ravel()
-                    etiquetas_ck = mask_flat[mask_ck_flat > 0]
-                    positive_labels = np.unique(etiquetas_ck)
-                    positive_flags = np.isin(valid_labels, positive_labels).astype(int)
-            else:
-                print(f"CK mask not found for {roi_key}")
-                positive_flags = np.zeros(len(valid_labels), dtype=int)
-            
-            df[f"is_positive_{formatted_name}"] = positive_flags
-
-        # CASO C) Otros canales: solo intensidad media
-        else:
-            intensity_flat = img_data[ch].ravel()
-            sum_intensities = np.bincount(mask_flat, weights=intensity_flat)
-            means = sum_intensities[valid] / counts[valid]
-            df[f"mean_intensity_{formatted_name}"] = means
+            df[f"mean_intensity_{col_base}"] = compute_mean_intensities(flat, img_ch, valid_labels, counts)
 
     return df
 
 
-# multiplex_pipeline/analysis/intensity.py
-
-import pandas as pd
-from typing import Dict, List
-
-def intensity_to_binary(
-    df_results: pd.DataFrame,
-    marker_notes: Dict[str, float],
-    exclude_cols: List[str] = None
-) -> pd.DataFrame:
+def intensity_to_binary(df: pd.DataFrame, thresholds: Dict[str, float], exclude: Optional[list] = None) -> pd.DataFrame:
     """
-    Convierte el DataFrame de intensidades en un DataFrame binario:
-    - Para cada marcador calcula umbral = mean_ROI + note * std_ROI
-    - Crea columna `{marker}_binary` con 1 si valor > umbral, 0 en caso contrario
-    - Devuelve solo [ROI, DAPI_ID, Area_pixels, Area_um2, centroid_x, centroid_y] + {marker}_binary
+    Converts intensities to binary values based on provided thresholds.
+
+    Args:
+        df (pd.DataFrame): The DataFrame containing intensity values.
+        thresholds (Dict[str, float]): A dictionary of thresholds to convert intensities to binary values.
+        exclude (Optional[list], optional): List of columns to exclude from binary conversion. Defaults to columns like ROI, DAPI_ID, etc.
+
+    Returns:
+        pd.DataFrame: A DataFrame with binary intensity columns.
     """
-    df = df_results.copy()
-    if exclude_cols is None:
-        exclude_cols = ['ROI','DAPI_ID','Area_pixels','Area_um2','centroid_x','centroid_y']
-    
-    # 1) Identificar columnas de marcador
-    marker_cols = [c for c in df.columns if c not in exclude_cols]
-    # 2) Media y std por ROI
-    means = df.groupby('ROI')[marker_cols].mean().reset_index()
-    stds  = df.groupby('ROI')[marker_cols].std().reset_index()
-    # 3) Merge
-    df_merged = df.merge(means, on='ROI', suffixes=('','_roi_mean'))
-    df_merged = df_merged.merge(stds,  on='ROI', suffixes=('','_roi_std'))
-    
-    # 4) Umbrales y binarización
-    for m in marker_cols:
-        note = marker_notes.get(m, 0.0)
-        df_merged[f'{m}_threshold'] = (
-            df_merged[f'{m}_roi_mean'] + note * df_merged[f'{m}_roi_std']
-        )
-        df_merged[f'{m}_binary'] = (
-            (df_merged[m] > df_merged[f'{m}_threshold'])
-            .astype(int)
-        )
-    
-    # 5) Seleccionar columnas finales
-    binary_cols = [f'{m}_binary' for m in marker_cols]
-    return df_merged[
-        ['ROI','DAPI_ID','Area_pixels','Area_um2','centroid_x','centroid_y']
-        + binary_cols
-    ]
+    exclude = exclude or ['ROI', 'DAPI_ID', 'Area_pixels', 'Area_um2', 'centroid_x', 'centroid_y']
+    markers = [c for c in df if c not in exclude]
+    means = df.groupby('ROI')[markers].mean()
+    stds = df.groupby('ROI')[markers].std()
+    dfb = df.join(means, on='ROI', rsuffix='_mean') \
+            .join(stds, on='ROI', rsuffix='_std')
+
+    for m in markers:
+        note = thresholds.get(m, 0.0)
+        dfb[f"{m}_threshold"] = dfb[f"{m}_mean"] + note * dfb[f"{m}_std"]
+        dfb[f"{m}_binary"] = (dfb[m] > dfb[f"{m}_threshold"]).astype(int)
+
+    cols = ['ROI', 'DAPI_ID', 'Area_pixels', 'Area_um2', 'centroid_x', 'centroid_y'] \
+         + [f"{m}_binary" for m in markers]
+    return dfb[cols]

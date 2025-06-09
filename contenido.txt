@@ -1,537 +1,965 @@
 ./analysis/intensity.py:
-import re
 import numpy as np
 import pandas as pd
 from skimage import measure
+from tqdm import tqdm
+
+from multiplex_pipeline.config          import ROI_PATTERN, DAPI_CONNECTIVITY, PIXEL_AREA
 from multiplex_pipeline.utils.validation import verify_binary
 
-def process_roi(img_name, 
-               img_data, 
-               dapi_masks_dict, 
-               ck_masks_dict, 
-               ngfr_masks_dict, 
-               channels, 
-               marker_dict,
-               pixel_area_um2):
-    """
-    Processes each ROI to generate a DataFrame with mean intensities,
-    binary values, area of each cell in micrometers squared,
-    and centroid coordinates in the image.
-    """
-    roi_match = re.search(r"(ROI\d+)", img_name, re.IGNORECASE)
-    if not roi_match:
-        print(f"ROI not found in image name: {img_name}")
-        return None
-    roi_key = roi_match.group(1).lower()  # Por ejemplo: "roi1"
+def extract_roi_key(img_name):
+    m = ROI_PATTERN.search(img_name)
+    return m.group(1).lower() if m else None
 
-    dapi_key = roi_key + "_dapi"
-    ck_key   = roi_key
-    ngfr_key = roi_key
-    
-    if dapi_key not in dapi_masks_dict:
-        print(f"{dapi_key} not found in dapi_masks_dict.")
-        return None
+def label_dapi(mask):
+    """Si la máscara es binaria, la etiqueta; si no, la devuelve."""
+    if len(np.unique(mask)) <= 2:
+        return measure.label(mask, connectivity=DAPI_CONNECTIVITY)
+    return mask
 
-    mask_dapi = dapi_masks_dict[dapi_key]
-    if mask_dapi.shape != img_data.shape[1:]:
-        print(f"Dimensions do not match for {img_name}: {mask_dapi.shape} vs {img_data.shape[1:]}")
-        return None
-
-    # Si la máscara DAPI está binaria, la etiquetamos
-    if len(np.unique(mask_dapi)) <= 2:
-        print(f"DAPI mask for {roi_key} is binary. Attempting to label.")
-        labeled_mask = measure.label(mask_dapi, connectivity=1)
-    else:
-        labeled_mask = mask_dapi
-
-    # Contamos cuántos píxeles hay de cada etiqueta
-    mask_flat = labeled_mask.ravel()
-    counts = np.bincount(mask_flat)
+def get_labels_and_counts(labeled_mask):
+    flat = labeled_mask.ravel()
+    counts = np.bincount(flat)
     labels = np.arange(len(counts))
     valid = (labels != 0) & (counts > 0)
-    valid_labels = labels[valid]
+    return labels[valid], counts[valid], flat
 
-    # === NUEVO: calculamos centroides de cada label con regionprops ===
-    props = measure.regionprops(labeled_mask)
-    label_centroids = {p.label: p.centroid for p in props}
+def get_centroids_map(labeled_mask):
+    return {p.label: p.centroid for p in measure.regionprops(labeled_mask)}
 
-    # Columnas base
+def compute_mean_intensities(mask_flat, img_channel, valid, counts):
+    sums = np.bincount(mask_flat, weights=img_channel.ravel())
+    return sums[valid] / counts
+
+def compute_binary_flags(valid_labels, mask_flat, mask):
+    verify_binary(mask, "mask")
+    flat = mask.ravel()
+    positive = np.unique(mask_flat[flat > 0])
+    return np.isin(valid_labels, positive).astype(int)
+
+def process_roi(
+    img_name,
+    img_data,
+    dapi_masks,
+    ck_masks,
+    ngfr_masks,
+    channels,
+    marker_dict,
+    pixel_area_um2=PIXEL_AREA
+):
+    roi = extract_roi_key(img_name)
+    if roi is None:
+        print(f"ROI no encontrada en '{img_name}'"); return None
+
+    dapi_key = f"{roi}_dapi"
+    if dapi_key not in dapi_masks:
+        print(f"{dapi_key} no existe en dapi_masks"); return None
+
+    mask_dapi = dapi_masks[dapi_key]
+    if mask_dapi.shape != img_data.shape[1:]:
+        print(f"Dimensiones no coinciden para {img_name}"); return None
+
+    lbl = label_dapi(mask_dapi)
+    valid_labels, counts, flat = get_labels_and_counts(lbl)
+    cent_map = get_centroids_map(lbl)
+
+    # DataFrame base
     df = pd.DataFrame({
-        "ROI": [roi_key] * len(valid_labels),
-        "DAPI_ID": valid_labels,
-        "Area_pixels": counts[valid],
-        "Area_um2": counts[valid] * pixel_area_um2
+        "ROI":           roi,
+        "DAPI_ID":       valid_labels,
+        "Area_pixels":   counts,
+        "Area_um2":      counts * pixel_area_um2,
+        "centroid_y":    [cent_map.get(l, (np.nan,))[0] for l in valid_labels],
+        "centroid_x":    [cent_map.get(l, (np.nan,))[1] for l in valid_labels],
     })
 
-    # Agregar columnas de centroides (y=row, x=col)
-    centroids_y = []
-    centroids_x = []
-    for lbl in valid_labels:
-        if lbl in label_centroids:
-            cy, cx = label_centroids[lbl]
+    # Intensidades y flags
+    for ch in tqdm(channels, desc=f"Canales {roi}", unit="ch"):
+        name = marker_dict.get(ch, f"Ch{ch}")
+        col_base = name.replace(" ", "_").replace("-", "_").replace(">", "").replace("<", "")
+        img_ch = img_data[ch]
+
+        if "ngfr" in name.lower():
+            df[f"mean_intensity_{col_base}"] = compute_mean_intensities(flat, img_ch, valid_labels, counts)
+            mask_ng = ngfr_masks.get(roi, np.zeros_like(mask_dapi))
+            df[f"is_positive_{col_base}"] = compute_binary_flags(valid_labels, flat, mask_ng)
+
+        elif "ck" in name.lower():
+            mask_ck = ck_masks.get(roi, np.zeros_like(mask_dapi))
+            df[f"is_positive_{col_base}"] = compute_binary_flags(valid_labels, flat, mask_ck)
+
         else:
-            cy, cx = (np.nan, np.nan)
-        centroids_y.append(cy)
-        centroids_x.append(cx)
+            df[f"mean_intensity_{col_base}"] = compute_mean_intensities(flat, img_ch, valid_labels, counts)
 
-    df["centroid_y"] = centroids_y
-    df["centroid_x"] = centroids_x
+    return df
 
-    # --- Iterar a través de los canales de interés ---
-    for ch in channels:
-        marker = marker_dict.get(ch, f"Channel_{ch}")
-        marker_lower = marker.lower()
+def intensity_to_binary(df, thresholds, exclude=None):
+    exclude = exclude or ['ROI','DAPI_ID','Area_pixels','Area_um2','centroid_x','centroid_y']
+    markers = [c for c in df if c not in exclude]
+    means = df.groupby('ROI')[markers].mean()
+    stds  = df.groupby('ROI')[markers].std()
+    dfb   = df.join(means,   on='ROI', rsuffix='_mean') \
+              .join(stds,    on='ROI', rsuffix='_std')
 
-        # Limpiamos el nombre del marcador para usarlo como columna
-        formatted_name = marker.replace(' ', '_').replace('-', '_').replace('>', '').replace('<', '')
+    for m in markers:
+        note = thresholds.get(m, 0.0)
+        dfb[f"{m}_threshold"] = dfb[f"{m}_mean"] + note * dfb[f"{m}_std"]
+        dfb[f"{m}_binary"]    = (dfb[m] > dfb[f"{m}_threshold"]).astype(int)
 
-        # CASO A) NGFR: intensidad media + binario
-        if "ngfr" in marker_lower:
-            intensity_flat = img_data[ch].ravel()
-            sum_intensities = np.bincount(mask_flat, weights=intensity_flat)
-            means = sum_intensities[valid] / counts[valid]
-            df[f"mean_intensity_{formatted_name}"] = means
-
-            if ngfr_key in ngfr_masks_dict:
-                mask_ngfr = ngfr_masks_dict[ngfr_key]
-                verify_binary(mask_ngfr, f"NGFR mask for {roi_key}")
-
-                if mask_ngfr.shape != mask_dapi.shape:
-                    print(f"Dimensions of NGFR mask {ngfr_key} do not match DAPI mask: {mask_ngfr.shape} vs {mask_dapi.shape}")
-                    positive_flags = np.zeros(len(valid_labels), dtype=int)
-                else:
-                    mask_ngfr_flat = mask_ngfr.ravel()
-                    etiquetas_ngfr = mask_flat[mask_ngfr_flat > 0]
-                    positive_labels = np.unique(etiquetas_ngfr)
-                    positive_flags = np.isin(valid_labels, positive_labels).astype(int)
-            else:
-                print(f"NGFR mask not found for {roi_key}")
-                positive_flags = np.zeros(len(valid_labels), dtype=int)
-            
-            df[f"is_positive_{formatted_name}"] = positive_flags
-
-        # CASO B) CK: solo máscara binaria
-        elif "ck" in marker_lower:
-            if ck_key in ck_masks_dict:
-                mask_ck = ck_masks_dict[ck_key]
-                verify_binary(mask_ck, f"CK mask for {roi_key}")
-
-                if mask_ck.shape != mask_dapi.shape:
-                    print(f"Dimensions of CK mask {ck_key} do not match DAPI mask: {mask_ck.shape} vs {mask_dapi.shape}")
-                    positive_flags = np.zeros(len(valid_labels), dtype=int)
-                else:
-                    mask_ck_flat = mask_ck.ravel()
-                    etiquetas_ck = mask_flat[mask_ck_flat > 0]
-                    positive_labels = np.unique(etiquetas_ck)
-                    positive_flags = np.isin(valid_labels, positive_labels).astype(int)
-            else:
-                print(f"CK mask not found for {roi_key}")
-                positive_flags = np.zeros(len(valid_labels), dtype=int)
-            
-            df[f"is_positive_{formatted_name}"] = positive_flags
-
-        # CASO C) Otros canales: solo intensidad media
-        else:
-            intensity_flat = img_data[ch].ravel()
-            sum_intensities = np.bincount(mask_flat, weights=intensity_flat)
-            means = sum_intensities[valid] / counts[valid]
-            df[f"mean_intensity_{formatted_name}"] = means
-
-    return df--------
+    cols = ['ROI','DAPI_ID','Area_pixels','Area_um2','centroid_x','centroid_y'] \
+         + [f"{m}_binary" for m in markers]
+    return dfb[cols]
+--------
 ./analysis/positivity.py:
 --------
 ./analysis/spatial.py:
 import os
 import numpy as np
 import pandas as pd
-from multiplex_pipeline.config import PIXEL_SIZE_MICROMETERS
-
 from scipy.spatial import cKDTree
 from skimage.measure import regionprops
+from multiplex_pipeline.config import PIXEL_SIZE, PIXEL_AREA
 
-
-def compute_mask_area_summary(ck_masks, ngfr_masks, pixel_area=PIXEL_SIZE_MICROMETERS**2):
+def compute_mask_area_summary(ck_masks, ngfr_masks, pixel_area=PIXEL_AREA):
     """
     Computes the area summary for each ROI based on CK and NGFR masks.
+
+    Returns:
+        pd.DataFrame: columns ['ROI', 'CK_Positive_Area_um2', 'CK_NGFR_Positive_Area_um2', 'total_area_roi_um2']
     """
     data = []
-    
     for roi in ck_masks:
-        ck_mask = ck_masks.get(roi, None)
-        ngfr_mask = ngfr_masks.get(roi, None)
-        
-        if ck_mask is None or ngfr_mask is None:
-            print(f"CK or NGFR mask for ROI '{roi}' not found. Skipping.")
+        ck_mask = ck_masks.get(roi)
+        ngfr_mask = ngfr_masks.get(roi)
+        if ck_mask is None or ngfr_mask is None or ck_mask.shape != ngfr_mask.shape:
             continue
-        
-        if ck_mask.shape != ngfr_mask.shape:
-            print(f"Mask shapes do not match for ROI '{roi}'. Skipping.")
-            continue
-        
-        # Calculate areas
-        area_ck_pos = np.sum(ck_mask == 1) * pixel_area
-        area_ck_ngfr_pos = np.sum((ck_mask == 1) & (ngfr_mask == 1)) * pixel_area
-        total_area = ck_mask.size * pixel_area  # Total area in µm²
-        
+        area_ck = np.sum(ck_mask == 1) * pixel_area
+        area_ckng = np.sum((ck_mask == 1) & (ngfr_mask == 1)) * pixel_area
+        total = ck_mask.size * pixel_area
         data.append({
             'ROI': roi,
-            'CK_Positive_Area_um2': area_ck_pos,
-            'CK_NGFR_Positive_Area_um2': area_ck_ngfr_pos,
-            'total_area_roi_um2': total_area
+            'CK_Positive_Area_um2': area_ck,
+            'CK_NGFR_Positive_Area_um2': area_ckng,
+            'total_area_roi_um2': total
         })
-    
-    mask_area_summary = pd.DataFrame(data)
-    return mask_area_summary
+    return pd.DataFrame(data)
 
 
 def compute_subpop_cells_per_area(
     df_binary,
     subpop_conditions,
-    condition_column_map,
-    mask_area_summary,
-    selected_rois,
-    path_save,
+    cond_map,            # antes: condition_column_map
+    mask_summary,        # antes: mask_area_summary
+    rois,                # antes: selected_rois
+    out_dir,             # antes: path_save
     roi_col='ROI'
 ):
     """
-    For each specified ROI:
-      1) Filters the cells that meet ALL the 'subpop_conditions'.
-      2) Counts the total number of cells in this subpopulation.
-      3) Includes the CK⁺ and CK⁺NGFR⁺ areas from mask_area_summary.
-      4) Calculates the concentration of cells per square micrometer (cells/µm²) 
-         for CK⁺ and CK⁺NGFR⁺ areas.
-      5) Saves the formatted summary as a CSV file in the specified path.
-    
-    Additionally:
-      - Renames the 'Subpopulation Cell Count' column to reflect the actual subpopulation conditions.
-    
-    Parameters:
-    - df_binary (pd.DataFrame): DataFrame containing cell information.
-    - subpop_conditions (list of str): List of conditions, e.g., ["CD3_intensity+", "CD4_intensity+", "FOXP3_intensity+"].
-    - condition_column_map (dict): Mapping of condition names to column names in df_binary.
-    - mask_area_summary (pd.DataFrame): DataFrame containing area information per ROI.
-    - selected_rois (list of str): List of ROIs to process, e.g., ["roi8","roi13","roi11","roi5"].
-    - path_save (str): Directory path where the CSV will be saved, e.g., "..\\results_spatial_analysis\\user\\cell_density_area".
-    - roi_col (str): Name of the column in df_binary that indicates the ROI.
-    
-    Returns:
-    - summary_df (pd.DataFrame): Summary DataFrame with metrics per ROI.
-    - summary_formatted (pd.DataFrame): Formatted DataFrame for better readability.
+    Retorna:
+      summary_df, summary_formatted
+
+    Parámetros renombrados para coincidir con tu llamada en el notebook:
+      cond_map      → mapping condiciones → columnas binarias
+      mask_summary  → DataFrame con áreas por ROI
+      rois          → lista de ROIs a procesar
+      out_dir       → carpeta donde se guardan los CSV formateados
     """
-    # 1. Parse the subpopulation conditions into a dictionary {column: value}
-    parsed_conditions = {}
+    import os
+    import pandas as pd
+    # 1) Parsear condiciones
+    parsed = {}
     for cond in subpop_conditions:
-        cond = cond.strip()
-        val = 1 if cond.endswith('+') else 0
-        base = cond[:-1].strip()
-        if base in condition_column_map:
-            col_name = condition_column_map[base]
-            parsed_conditions[col_name] = val
+        val = 1 if cond.strip().endswith('+') else 0
+        key = cond.strip()[:-1].strip()
+        col = cond_map.get(key)
+        if col:
+            parsed[col] = val
         else:
-            print(f"Warning: No mapping for '{cond}' → ignoring.")
-    
-    # 2. Create a lookup dictionary for areas per ROI
-    area_lookup = mask_area_summary.set_index('ROI')
-    
-    # 3. Filter df_binary to include only selected_rois
-    df_filtered = df_binary[df_binary[roi_col].isin(selected_rois)]
-    
-    # Check for ROIs in selected_rois not present in df_binary
-    missing_in_binary = set(selected_rois) - set(df_filtered[roi_col].unique())
-    if missing_in_binary:
-        print(f"Warning: The following ROIs are specified in selected_rois but not found in df_binary: {missing_in_binary}")
-    
-    # 4. Group the filtered df_binary by ROI
-    grouped = df_filtered.groupby(roi_col, dropna=False)
-    
+            print(f"Warning: No mapping para '{cond}' → ignorando.")
+
+    # 2) Lookup de áreas
+    area_lookup = mask_summary.set_index('ROI')
+
+    # 3) Filtrar solo ROIs
+    df_filt = df_binary[df_binary[roi_col].isin(rois)]
+    missing = set(rois) - set(df_filt[roi_col].unique())
+    if missing:
+        print(f"Warning: ROIs en 'rois' no halladas en df_binary: {missing}")
+
+    # 4) Iterar por ROI
     results = []
-    
-    for roi, group_df in grouped:
-        # a. Check if the ROI exists in mask_area_summary
-        if roi not in area_lookup.index:
-            print(f"Warning: ROI '{roi}' not found in mask_area_summary. Skipping.")
+    for roi in rois:
+        grp = df_filt[df_filt[roi_col] == roi]
+        if grp.empty or roi not in area_lookup.index:
             continue
-        
-        # b. Filter the subpopulation that meets ALL conditions
-        mask_subpop = pd.Series([True] * len(group_df), index=group_df.index)
-        for bin_col, needed_val in parsed_conditions.items():
-            if bin_col in group_df.columns:
-                mask_subpop &= (group_df[bin_col] == needed_val)
-            else:
-                print(f"Warning: Column '{bin_col}' not found in df_binary for ROI '{roi}'.")
-                mask_subpop &= False  # If the column is not present, no match
-        
-        subpop_df = group_df[mask_subpop]
-        subpop_count = len(subpop_df)
-        
-        # c. Retrieve areas from mask_area_summary
-        area_ck = area_lookup.loc[roi, 'CK_Positive_Area_um2'] if 'CK_Positive_Area_um2' in area_lookup.columns else 0
-        area_ck_ngfr = area_lookup.loc[roi, 'CK_NGFR_Positive_Area_um2'] if 'CK_NGFR_Positive_Area_um2' in area_lookup.columns else 0
-        
-        # d. Calculate cell concentration per square micrometer for each specific area
-        cells_per_um2_ck = subpop_count / area_ck if area_ck > 0 else 0
-        cells_per_um2_ck_ngfr = subpop_count / area_ck_ngfr if area_ck_ngfr > 0 else 0
-        
-        # e. Add the results
+
+        # filtrar subpoblación
+        mask_sub = pd.Series(True, index=grp.index)
+        for col, val in parsed.items():
+            mask_sub &= (grp[col] == val)
+        cnt = mask_sub.sum()
+
+        # áreas
+        area_ck   = area_lookup.at[roi, 'CK_Positive_Area_um2']
+        area_ckng = area_lookup.at[roi, 'CK_NGFR_Positive_Area_um2']
+
+        # densidades
+        dens_ck   = cnt/area_ck   if area_ck>0   else 0
+        dens_ckng = cnt/area_ckng if area_ckng>0 else 0
+
         results.append({
             'ROI': roi,
-            'Subpopulation_Cell_Count': subpop_count,
+            'Subpopulation_Cell_Count': cnt,
             'CK_Positive_Area_um2': area_ck,
-            'CK_NGFR_Positive_Area_um2': area_ck_ngfr,
-            'Cells_per_um2_CK_Positive': cells_per_um2_ck,        # Cells per µm² of CK⁺
-            'Cells_per_um2_CK_NGFR_Positive': cells_per_um2_ck_ngfr  # Cells per µm² of CK⁺NGFR⁺
+            'CK_NGFR_Positive_Area_um2': area_ckng,
+            'Cells_per_um2_CK_Positive': dens_ck,
+            'Cells_per_um2_CK_NGFR_Positive': dens_ckng
         })
-        
-        # f. Debugging information
-        print(f"ROI: {roi}")
-        print(f"Subpopulation Count: {subpop_count}")
-        print(f"CK⁺ Area (µm²): {area_ck}")
-        print(f"CK⁺NGFR⁺ Area (µm²): {area_ck_ngfr}")
-        print(f"Cells per µm² (CK⁺): {cells_per_um2_ck:.6f}")
-        print(f"Cells per µm² (CK⁺NGFR⁺): {cells_per_um2_ck_ngfr:.6f}")
-        print("-" * 50)
-    
-    # 5. Check for ROIs specified in selected_rois but missing in mask_area_summary
-    missing_in_mask = set(selected_rois) - set(area_lookup.index)
-    if missing_in_mask:
-        print(f"Warning: The following ROIs are specified in selected_rois but not found in mask_area_summary: {missing_in_mask}")
-    
-    # 6. Create the summary DataFrame
+
+    # 5) DataFrames de salida
     summary_df = pd.DataFrame(results)
-    
-    # 7. Format the DataFrame for better readability
-    summary_formatted = summary_df.copy()
-    
-    # Maintain precision in 'Cells_per_um2' without rounding
-    summary_formatted['Cells_per_um2_CK_Positive'] = summary_formatted['Cells_per_um2_CK_Positive'].apply(lambda x: f"{x:.6f}")
-    summary_formatted['Cells_per_um2_CK_NGFR_Positive'] = summary_formatted['Cells_per_um2_CK_NGFR_Positive'].apply(lambda x: f"{x:.6f}")
-    
-    # Format areas to two decimal places
-    summary_formatted['CK_Positive_Area_um2'] = summary_formatted['CK_Positive_Area_um2'].apply(lambda x: f"{x:.2f}")
-    summary_formatted['CK_NGFR_Positive_Area_um2'] = summary_formatted['CK_NGFR_Positive_Area_um2'].apply(lambda x: f"{x:.2f}")
-    
-    # 8. Generate dynamic label for Subpopulation
-    # Join the subpop_conditions with underscores and replace '+' with 'Pos' to make it filename-friendly
-    safe_subpop_label = "_".join([cond.replace("+", "Pos").replace(" ", "") for cond in subpop_conditions])
-    
-    # 9. Rename columns for clarity, including dynamic subpopulation label
-    summary_formatted.rename(columns={
-        'Subpopulation_Cell_Count': f'Subpopulation Cell Count ({", ".join(subpop_conditions)})',
-        'CK_Positive_Area_um2': 'CK⁺ Area (µm²)',
-        'CK_NGFR_Positive_Area_um2': 'CK⁺NGFR⁺ Area (µm²)',
-        'Cells_per_um2_CK_Positive': 'Cells per µm² (CK⁺)',
-        'Cells_per_um2_CK_NGFR_Positive': 'Cells per µm² (CK⁺NGFR⁺)'
+
+    # 6) Formatear para guardado
+    summary_fmt = summary_df.copy()
+    summary_fmt['Cells_per_um2_CK_Positive']   = summary_fmt['Cells_per_um2_CK_Positive'].map(lambda x: f"{x:.6f}")
+    summary_fmt['Cells_per_um2_CK_NGFR_Positive'] = summary_fmt['Cells_per_um2_CK_NGFR_Positive'].map(lambda x: f"{x:.6f}")
+    summary_fmt['CK_Positive_Area_um2']   = summary_fmt['CK_Positive_Area_um2'].map(lambda x: f"{x:.2f}")
+    summary_fmt['CK_NGFR_Positive_Area_um2'] = summary_fmt['CK_NGFR_Positive_Area_um2'].map(lambda x: f"{x:.2f}")
+
+    # Renombrar columnas con etiqueta dinámica
+    label = "_".join([c.replace("+","Pos").replace(" ", "") for c in subpop_conditions])
+    summary_fmt.rename(columns={
+        'Subpopulation_Cell_Count': f"Subpopulation Cell Count ({', '.join(subpop_conditions)})",
+        'CK_Positive_Area_um2':     'CK⁺ Area (µm²)',
+        'CK_NGFR_Positive_Area_um2':'CK⁺NGFR⁺ Area (µm²)',
+        'Cells_per_um2_CK_Positive':'Cells per µm² (CK⁺)',
+        'Cells_per_um2_CK_NGFR_Positive':'Cells per µm² (CK⁺NGFR⁺)'
     }, inplace=True)
-    
-    # 10. Ensure the save directory exists
-    os.makedirs(path_save, exist_ok=True)
-    
-    # 11. Construct an appropriate CSV filename without datetime
-    # For example: 'cell_density_area_CD3_intensityPos_CD4_intensityPos_FOXP3_intensityPos.csv'
-    csv_filename = f"cell_density_area_{safe_subpop_label}.csv"
-    csv_path = os.path.join(path_save, csv_filename)
-    
-    # 12. Save the formatted summary as CSV
-    summary_formatted.to_csv(csv_path, index=False)
-    print(f"\nFormatted summary saved as CSV at: {csv_path}")
-    
-    # 13. Display the formatted DataFrame
-    print("\nFormatted Summary DataFrame:")
-    print(summary_formatted)
-    
-    return summary_df, summary_formatted  # Return both for flexibility
+
+    # Guardar CSV
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, f"cell_density_area_{label}.csv")
+    summary_fmt.to_csv(csv_path, index=False)
+    print(f"Saved: {csv_path}")
+
+    return summary_df, summary_fmt
+
+
+
 def compute_distances(sub_df, mask, bin_col):
     """
-    Returns two lists:
-        dist_to_pos, dist_to_neg   (µm)
+    For each cell in sub_df (with centroid_row/col), returns two lists:
+       distances to mask positive and negative regions (µm).
     """
-    pos_pts = np.column_stack(np.where(mask == 1))
-    neg_pts = np.column_stack(np.where(mask == 0))
-    tree_pos = cKDTree(pos_pts) if len(pos_pts) else None
-    tree_neg = cKDTree(neg_pts) if len(neg_pts) else None
-
-    d_pos, d_neg = [], []
+    pos = np.column_stack(np.where(mask == 1))
+    neg = np.column_stack(np.where(mask == 0))
+    tree_p = cKDTree(pos) if len(pos) else None
+    tree_n = cKDTree(neg) if len(neg) else None
+    d_to_pos, d_to_neg = [], []
     for _, r in sub_df.iterrows():
-        centroid = (r['centroid_row'], r['centroid_col'])
-        if r[bin_col] == 1:  # marker+
-            dist = tree_neg.query(centroid)[0] if tree_neg else 0.0
-            d_pos.append(0.0)
-            d_neg.append(dist * PIXEL_SIZE_MICROMETERS)
-        else:                # marker‑
-            dist = tree_pos.query(centroid)[0] if tree_pos else 0.0
-            d_pos.append(dist * PIXEL_SIZE_MICROMETERS)
-            d_neg.append(0.0)
-    return d_pos, d_neg
+        cent = (r['centroid_row'], r['centroid_col'])
+        if r.get(bin_col, 0) == 1:
+            d_to_pos.append(0.0)
+            d_to_neg.append(tree_n.query(cent)[0] * PIXEL_SIZE if tree_n else 0.0)
+        else:
+            d_to_pos.append(tree_p.query(cent)[0] * PIXEL_SIZE if tree_p else 0.0)
+            d_to_neg.append(0.0)
+    return d_to_pos, d_to_neg
+
+
 def get_centroids(dapi_mask):
     """
-    Extracts centroids (row, col) from the labeled DAPI mask.
-    Returns a DataFrame with DAPI_ID, centroid_row, centroid_col.
+    Extracts centroids from a labeled DAPI mask.
+    Returns DataFrame with columns ['DAPI_ID','centroid_row','centroid_col']
     """
-    props = regionprops(dapi_mask)
     data = []
-    for prop in props:
-        data.append({
-            'DAPI_ID': prop.label,
-            'centroid_row': int(prop.centroid[0]),
-            'centroid_col': int(prop.centroid[1])
-        })
+    for p in regionprops(dapi_mask):
+        r, c = p.centroid
+        data.append({'DAPI_ID': p.label, 'centroid_row': int(r), 'centroid_col': int(c)})
     return pd.DataFrame(data)
-
-
 
 
 def compute_subpop_distances(subpopA_df, subpopB_df):
     """
-    For each cell in A and each cell in B, creates all A–B pairs and computes
-    the distance in pixels. Returns a DataFrame with all pairwise distances (no NaN).
+    Computes pairwise distances (pixels) between subpop A and B centroids.
+    Returns DataFrame with columns [B_cell_id,B_row,B_col,A_cell_id,A_row,A_col,distance_px].
     """
-    if len(subpopA_df) == 0 or len(subpopB_df) == 0:
-        return pd.DataFrame()  # Nothing to compute
-
-    # Cartesian product: B x A
-    cartesian_df = subpopB_df.assign(key=1).merge(
-        subpopA_df.assign(key=1),
-        on='key',
-        suffixes=('_b', '_a')
-    ).drop('key', axis=1)
-
-    # Compute distance for each pair
-    cartesian_df['distance_px'] = np.sqrt(
-        (cartesian_df['centroid_row_b'] - cartesian_df['centroid_row_a'])**2 +
-        (cartesian_df['centroid_col_b'] - cartesian_df['centroid_col_a'])**2
-    )
-
-    # Rename columns for consistency
-    result = cartesian_df[[
-        'DAPI_ID_b', 'centroid_row_b', 'centroid_col_b',
-        'DAPI_ID_a', 'centroid_row_a', 'centroid_col_a', 'distance_px'
-    ]]
-    result.columns = [
-        'B_cell_id', 'B_row', 'B_col',
-        'A_cell_id', 'A_row', 'A_col', 'distance_px'
-    ]
-
-    return result
+    if subpopA_df.empty or subpopB_df.empty:
+        return pd.DataFrame()
+    A = subpopA_df.assign(key=1)
+    B = subpopB_df.assign(key=1)
+    df = pd.merge(B, A, on='key', suffixes=('_b','_a')).drop('key', axis=1)
+    df['distance_px'] = np.sqrt((df['centroid_row_b']-df['centroid_row_a'])**2 + (df['centroid_col_b']-df['centroid_col_a'])**2)
+    return df.rename(columns={
+        'DAPI_ID_b': 'B_cell_id', 'centroid_row_b': 'B_row', 'centroid_col_b': 'B_col',
+        'DAPI_ID_a': 'A_cell_id', 'centroid_row_a': 'A_row','centroid_col_a': 'A_col'
+    })
 --------
 ./analysis/subpopulations.py:
 --------
 ./analysis/__init__.py:
 --------
 ./config.py:
-PIXEL_SIZE_MICROMETERS = 0.17
-MASK_ALPHA             = 0.5 
-cnio_user="jgagullo"--------
+# config.py
+import os
+import re
+from pathlib import Path
+from multiplex_pipeline.preprocessing.segmentation import post_process_mask, post_process_mask_closing
+
+# User information
+CNIO_USER = "jgagullo"
+
+# Server base paths
+BASE_SERVER_PATH = Path(r"\\imgserver.cnio.es\IMAGES\CONFOCAL\IA\Projects\2024\2024_10_21_jgagullo\spatial analisis\qpath")
+DATA_FOLDER = BASE_SERVER_PATH / "data" / CNIO_USER
+EXPORT_DAPI_FOLDER = BASE_SERVER_PATH / "qpathprojects" / CNIO_USER / "export_DAPI"
+EXPORTED_MASKS_FOLDER = BASE_SERVER_PATH / "qpathprojects" / CNIO_USER / "exportedmasks"
+
+# File patterns
+IMAGE_EXTENSIONS = [".ome.tiff", ".tiff", ".tif"]
+DAPI_PATTERN = re.compile(r"roi(\d+)_dapi", re.IGNORECASE)
+CSV_EXTENSION = ".csv"
+
+# Results directories (padre, sin usuario)
+RESULTS_BASE_DIR         = Path(".") / "results_spatial_analysis"
+CELL_COUNT_OUTPUT_DIR    = RESULTS_BASE_DIR / CNIO_USER / "cell_counting"
+CELL_DENSITY_OUTPUT_DIR  = RESULTS_BASE_DIR / CNIO_USER / "cell_density_area"
+BOXPLOTS_DISTANCES_DIR   = RESULTS_BASE_DIR / CNIO_USER / "boxplots_distances_to_mask"
+BOXPLOTS_DISTANCES_HEATMAPS_DIR   = RESULTS_BASE_DIR / CNIO_USER / "boxplots_distances_between_populations"
+DISTANCES_SUBPOP_DIR     = RESULTS_BASE_DIR / CNIO_USER / "distances_between_mask_and_subpopulation"
+DISTANCES_POPULATIONS_DIR= RESULTS_BASE_DIR / CNIO_USER / "distances_between_populations"
+
+# Imaging constants
+PIXEL_SIZE       = 0.17  # micrometers
+PIXEL_AREA       = PIXEL_SIZE ** 2  # µm²
+MASK_ALPHA       = 0.5
+DEFAULT_BRIGHTNESS = 10
+
+# Channels and markers
+CHANNELS_OF_INTEREST = [10, 13, 7, 17, 1, 0, 15, 5, 20, 21, 9, 19, 3]
+MARKER_LABELS = {
+    0: "FOXP3",
+    1: "IFN-gamma",
+    2: "CD20 - cyto",
+    3: "HLA-DR",
+    4: "CD279",
+    5: "CD4",
+    6: "A_Podoplan",
+    7: "Ki67",
+    8: "CD163",
+    9: "CD11b",
+    10: "Pan-Cytokeratin CK",
+    11: "A_Actin",
+    12: "CD31",
+    13: "NGFR",
+    14: "DAPI",
+    15: "CD3",
+    16: "CD56",
+    17: "CD274",
+    18: "CD45",
+    19: "CD11c",
+    20: "CD8a",
+    21: "CD68",
+}
+
+# Mask creation settings
+CK_SETTINGS = {
+    "channel_index": 10,
+    "user_scores": -1,
+    "scaling_divisor": 10,
+    "base_folder_path": EXPORTED_MASKS_FOLDER,
+    "min_size": 2000,
+    "max_hole_size": 10000,
+    "mask_label": "CK",
+    "mask_filename": "CK_mask_binary.tif",
+    "post_process_funcs": [post_process_mask],
+    "brightness_factor": None,
+    "require_dapi": False,
+}
+NGFR_SETTINGS = {
+    "channel_index": 13,
+    "user_scores": {
+        'ROI1.ome.tiff': 2.7, 'ROI2.ome.tiff': 2.7, 'ROI3.ome.tiff': 2.7,
+        'ROI4.ome.tiff': 1.8, 'ROI5.ome.tiff': 1.8, 'ROI6.ome.tiff': 1.8,
+        'ROI7.ome.tiff': 1.5, 'ROI8.ome.tiff': 1.2,'ROI9.ome.tiff': 1.2, 'ROI10.ome.tiff': 2.7,
+        'ROI11.ome.tiff': 2.4, 'ROI12.ome.tiff': 2.7, 'ROI13.ome.tiff': 2.1,
+    },
+    "scaling_divisor": 3,
+    "base_folder_path": EXPORTED_MASKS_FOLDER,
+    "min_size": 200,
+    "max_hole_size": 75000,
+    "mask_label": "NGFR",
+    "mask_filename": "NGFR_mask_binary.tif",
+    "post_process_funcs": [post_process_mask_closing, post_process_mask],
+    "brightness_factor": 25,
+    "require_dapi": True,
+}
+
+# Intensity thresholds
+INTENSITY_THRESHOLDS = {
+    'is_positive_Pan_Cytokeratin_CK': 0,
+    'mean_intensity_NGFR': 0.25,
+    'is_positive_NGFR': 0,
+    'mean_intensity_Ki67': 0,
+    'mean_intensity_CD274': 2.5,
+    'mean_intensity_IFN_gamma': 1.5,
+    'mean_intensity_FOXP3': 2.25,
+    'mean_intensity_CD3': 1.25,
+    'mean_intensity_CD4': 1,
+    'mean_intensity_CD8a': 2.5,
+    'mean_intensity_CD68': 2,
+    'mean_intensity_CD11b': 2,
+    'mean_intensity_CD11c': 2,
+    'mean_intensity_HLA_DR': 1.5,
+}
+
+
+CARACTERIZATION_COMBINATIONS = {
+    'Tumor': lambda df: df['is_positive_Pan_Cytokeratin_CK_binary'] == 1,
+    'Tumor NGFR+': lambda df: (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) & (df['mean_intensity_NGFR_binary'] == 1),
+    'Tumor NGFR-': lambda df: (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) & (df['mean_intensity_NGFR_binary'] == 0),
+    'Tumor NGFR+ Ki67+': lambda df: (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) & (df['mean_intensity_NGFR_binary'] == 1) & (df['mean_intensity_Ki67_binary'] == 1),
+    'Tumor NGFR- Ki67+': lambda df: (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) & (df['mean_intensity_NGFR_binary'] == 0) & (df['mean_intensity_Ki67_binary'] == 1),
+    'Tumor NGFR+ CD274+': lambda df: (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) & (df['mean_intensity_NGFR_binary'] == 1) & (df['mean_intensity_CD274_binary'] == 1),
+    'Tumor NGFR- CD274+': lambda df: (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) & (df['mean_intensity_NGFR_binary'] == 0) & (df['mean_intensity_CD274_binary'] == 1),
+    'Tumor NGFR+ IFN+': lambda df: (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) & (df['mean_intensity_NGFR_binary'] == 1) & (df['mean_intensity_IFN_gamma_binary'] == 1),
+    'Tumor NGFR- IFN+': lambda df: (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) & (df['mean_intensity_NGFR_binary'] == 0) & (df['mean_intensity_IFN_gamma_binary'] == 1),
+    'Tumor NGFR+ HLA_DR+': lambda df: (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) & (df['mean_intensity_NGFR_binary'] == 0) & (df['mean_intensity_HLA_DR_binary'] == 1),
+    'Tumor NGFR- HLA_DR+': lambda df: (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) & (df['mean_intensity_NGFR_binary'] == 0) & (df['mean_intensity_HLA_DR_binary'] == 1),
+    
+  
+}
+
+
+# Combinations for tumor infiltration
+INFILTRATION_COMBINATIONS = {
+    'Tumor CD3+ CD4+ FOXP3+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['mean_intensity_CD3_binary'] == 1) &
+        (df['mean_intensity_CD4_binary'] == 1) &
+        (df['mean_intensity_FOXP3_binary'] == 1)
+    ),
+    'Stroma CD3+ CD4+ FOXP3+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 0) &
+        (df['mean_intensity_CD3_binary'] == 1) &
+        (df['mean_intensity_CD4_binary'] == 1) &
+        (df['mean_intensity_FOXP3_binary'] == 1)
+    ),
+    'Tumor CD3+ CD8+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['mean_intensity_CD3_binary'] == 1) &
+        (df['mean_intensity_CD8a_binary'] == 1)
+    ),
+    'Stroma CD3+ CD8+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 0) &
+        (df['mean_intensity_CD3_binary'] == 1) &
+        (df['mean_intensity_CD8a_binary'] == 1)
+    ),
+    'Tumor CD68+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['mean_intensity_CD68_binary'] == 1)
+    ),
+    'Stroma CD68+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 0) &
+        (df['mean_intensity_CD68_binary'] == 1)
+    ),
+    'Tumor CD11b+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['mean_intensity_CD11b_binary'] == 1)
+    ),
+    'Stroma CD11b+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 0) &
+        (df['mean_intensity_CD11b_binary'] == 1)
+    ),
+    'Tumor CD11c+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['mean_intensity_CD11c_binary'] == 1)
+    ),
+    'Stroma CD11c+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 0) &
+        (df['mean_intensity_CD11c_binary'] == 1)
+    ),
+    'Tumor MHCII+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['mean_intensity_HLA_DR_binary'] == 1)
+    ),
+    'Stroma MHCII+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 0) &
+        (df['mean_intensity_HLA_DR_binary'] == 1)
+    ),
+}
+
+# Combinations for NGFR-related infiltration
+NGFR_INFILTRATION_COMBINATIONS = {
+    'Tumor NGFR+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['is_positive_NGFR_binary'] == 1)
+    ),
+    'Tumor NGFR-': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['is_positive_NGFR_binary'] == 0)
+    ),
+    'Tumor NGFR+ CD3+ CD4+ FOXP3+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['is_positive_NGFR_binary'] == 1) &
+        (df['mean_intensity_CD3_binary'] == 1) &
+        (df['mean_intensity_CD4_binary'] == 1) &
+        (df['mean_intensity_FOXP3_binary'] == 1)
+    ),
+    'Tumor NGFR- CD3+ CD4+ FOXP3+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['is_positive_NGFR_binary'] == 0) &
+        (df['mean_intensity_CD3_binary'] == 1) &
+        (df['mean_intensity_CD4_binary'] == 1) &
+        (df['mean_intensity_FOXP3_binary'] == 1)
+    ),
+    'Tumor NGFR+ CD3+ CD8+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['is_positive_NGFR_binary'] == 1) &
+        (df['mean_intensity_CD3_binary'] == 1) &
+        (df['mean_intensity_CD8a_binary'] == 1)
+    ),
+    'Tumor NGFR- CD3+ CD8+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['is_positive_NGFR_binary'] == 0) &
+        (df['mean_intensity_CD3_binary'] == 1) &
+        (df['mean_intensity_CD8a_binary'] == 1)
+    ),
+    'Tumor NGFR+ CD3+ CD8+ IFN+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['is_positive_NGFR_binary'] == 1) &
+        (df['mean_intensity_CD3_binary'] == 1) &
+        (df['mean_intensity_CD8a_binary'] == 1) &
+        (df['mean_intensity_IFN_gamma_binary'] == 1)
+    ),
+    'Tumor NGFR- CD3+ CD8+ IFN+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['is_positive_NGFR_binary'] == 0) &
+        (df['mean_intensity_CD3_binary'] == 1) &
+        (df['mean_intensity_CD8a_binary'] == 1) &
+        (df['mean_intensity_IFN_gamma_binary'] == 1)
+    ),
+    'Tumor NGFR+ CD68+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['is_positive_NGFR_binary'] == 1) &
+        (df['mean_intensity_CD68_binary'] == 1)
+    ),
+    'Tumor NGFR- CD68+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['is_positive_NGFR_binary'] == 0) &
+        (df['mean_intensity_CD68_binary'] == 1)
+    ),
+    'Tumor NGFR+ CD11b+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['is_positive_NGFR_binary'] == 1) &
+        (df['mean_intensity_CD11b_binary'] == 1)
+    ),
+    'Tumor NGFR- CD11b+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['is_positive_NGFR_binary'] == 0) &
+        (df['mean_intensity_CD11b_binary'] == 1)
+    ),
+    'Tumor NGFR+ CD11c+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['is_positive_NGFR_binary'] == 1) &
+        (df['mean_intensity_CD11c_binary'] == 1)
+    ),
+    'Tumor NGFR- CD11c+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['is_positive_NGFR_binary'] == 0) &
+        (df['mean_intensity_CD11c_binary'] == 1)
+    ),
+    'Tumor NGFR+ MHCII+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['is_positive_NGFR_binary'] == 1) &
+        (df['mean_intensity_HLA_DR_binary'] == 1)
+    ),
+    'Tumor NGFR- MHCII+': lambda df: (
+        (df['is_positive_Pan_Cytokeratin_CK_binary'] == 1) &
+        (df['is_positive_NGFR_binary'] == 0) &
+        (df['mean_intensity_HLA_DR_binary'] == 1)
+    ),
+}
+
+# Condition column mapping
+CONDITION_COLUMN_MAP = {
+    'FOXP3_intensity': 'mean_intensity_FOXP3_binary',
+    'IFN-gamma_intensity': 'mean_intensity_IFN_gamma_binary',
+    'HLA-DR_intensity': 'mean_intensity_HLA_DR_binary',
+    'CD4_intensity': 'mean_intensity_CD4_binary',
+    'Ki67_intensity': 'mean_intensity_Ki67_binary',
+    'CD163_intensity': 'mean_intensity_CD163_binary',
+    'CD11b_intensity': 'mean_intensity_CD11b_binary',
+    'CD3_intensity': 'mean_intensity_CD3_binary',
+    'CD274_intensity': 'mean_intensity_CD274_binary',
+    'CD11c_intensity': 'mean_intensity_CD11c_binary',
+    'CD8a_intensity': 'mean_intensity_CD8a_binary',
+    'CD68_intensity': 'mean_intensity_CD68_binary',
+    'CK_mask': 'is_positive_Pan_Cytokeratin_CK_binary',
+    'NGFR_mask': 'is_positive_NGFR_binary',
+    'NGFR_intensity': 'mean_intensity_NGFR_binary',
+}
+
+# Subpopulation definitions
+SUBPOPULATIONS = {
+    "Tregs": ["CD3_intensity+", "CD4_intensity+", "FOXP3_intensity+"],
+    "T CD8+": ["CD3_intensity+", "CD8a_intensity+"],
+    "T CD8+ Activator": ["CD3_intensity+", "CD8a_intensity+", "IFN-gamma_intensity+"],
+    "Macrophages CD68+": ["CD68_intensity+"],
+    "DC CD11b+": ["CD11b_intensity+"],
+    "DC CD11c+": ["CD11c_intensity+"],
+    "DC HLA-DR+": ["HLA-DR_intensity+"],
+}
+
+# Conditions for two-population distances (A group)
+SUBPOPULATION_A_POSITIVE = ["CK_mask+", "NGFR_intensity+"]
+SUBPOPULATION_A_NEGATIVE = ["CK_mask+", "NGFR_intensity-"]
+
+# CK-only subpopulations for two-population distances
+CK_SUBPOPULATIONS = {
+    "CK+ Tregs": ["CK_mask+", "CD3_intensity+", "CD4_intensity+", "FOXP3_intensity+"],
+    "CK+ T CD8+": ["CK_mask+", "CD3_intensity+", "CD8a_intensity+"],
+    "T CD8+ Activator": ["CD3_intensity+", "CD8a_intensity+", "IFN-gamma_intensity+"],
+    "CK+ Macrophages": ["CK_mask+", "CD68_intensity+"],
+    "CK+ DC CD11b+": ["CK_mask+", "CD11b_intensity+"],
+    "CK+ DC CD11c+": ["CK_mask+", "CD11c_intensity+"],
+    "CK+ DC HLA-DR+": ["CK_mask+", "HLA-DR_intensity+"],
+}
+
+# Shading colors for heatmaps
+SHADING_COLORS = {
+    "CK_mask": (1.0, 0.0, 0.0),  # red
+    "NGFR_mask": (1.0, 0.0, 1.0),  # magenta
+}
+
+# ROIs to analyze
+ROIS_TO_ANALYZE = ["roi1"]
+
+
+ #process_roi
+import re
+ROI_PATTERN       = re.compile(r"(ROI\d+)", re.IGNORECASE)
+DAPI_CONNECTIVITY = 1--------
 ./io/loaders.py:
+from pathlib import Path
+from typing import Dict
+import pandas as pd
+import numpy as np
+from tifffile import imread
+import imageio.v2 as imageio
+from tqdm import tqdm
+
+from multiplex_pipeline.config import (
+    DATA_FOLDER,
+    EXPORT_DAPI_FOLDER,
+    IMAGE_EXTENSIONS,
+    DAPI_PATTERN,
+    CSV_EXTENSION,
+)
+
+
+def load_ome_tif_images(
+    data_folder: Path = DATA_FOLDER,
+    show_progress: bool = True
+) -> Dict[str, np.ndarray]:
+    """
+    Loads all OME-TIFF images from the specified folder.
+    Returns a dict mapping filename -> image array (C, H, W).
+
+    Parameters:
+        data_folder: Path to search for images.
+        show_progress: If True, displays a progress bar during loading.
+    """
+    images: Dict[str, np.ndarray] = {}
+    base = Path(data_folder)
+
+    # Normalizar extensiones a minúsculas
+    exts = {e.lower() for e in IMAGE_EXTENSIONS}
+
+    # Recolectar todos los ficheros cuya concatenación de sufijos coincida con alguna extensión
+    candidates = [
+        p for p in base.iterdir()
+        if p.is_file() and ''.join(p.suffixes).lower() in exts
+    ]
+
+    iterator = tqdm(candidates, desc="Loading OME-TIFF images", unit="img") if show_progress else candidates
+    for path in iterator:
+        try:
+            img = imread(path)
+            images[path.name] = img
+            break #BOORRAR ESTA LINEAAAA
+        except Exception as e:
+            print(f"Error loading {path.name}: {e}")
+    return images
+
+
+def load_dapi_masks(
+    export_folder: Path = EXPORT_DAPI_FOLDER,
+    show_progress: bool = True
+) -> Dict[str, np.ndarray]:
+    """
+    Loads DAPI mask files matching DAPI_PATTERN from export_folder.
+    Returns a dict mapping 'roiX' -> 2D mask array.
+
+    Parameters:
+        export_folder: Path where DAPI masks are stored.
+        show_progress: If True, displays a progress bar during loading.
+    """
+    masks: Dict[str, np.ndarray] = {}
+    base = Path(export_folder)
+    tif_paths = [p for p in base.iterdir() if p.suffix.lower() == '.tif']
+
+    iterator = tqdm(tif_paths, desc="Loading DAPI masks", unit="mask") if show_progress else tif_paths
+    for path in iterator:
+        m = DAPI_PATTERN.search(path.stem)
+        if not m:
+            print(f"Skipping file '{path.name}', does not match DAPI pattern.")
+            continue
+        key = f"roi{m.group(1)}_dapi"
+        # Only load ROI1 for testing
+        if key.lower() != 'roi1_dapi':
+            continue
+        try:
+            masks[key] = imageio.imread(path)
+        except Exception as e:
+            print(f"Error loading DAPI mask {path.name}: {e}")
+    return masks
+
+
+def load_csv_data(
+    base_path: Path,
+    show_progress: bool = True
+) -> Dict[str, Dict[str, pd.DataFrame]]:
+    """
+    Recursively loads all CSV files under base_path
+    into a nested dict {subfolder: {filename: DataFrame}}.
+
+    Parameters:
+        base_path: Root directory to search for CSVs.
+        show_progress: If True, displays a progress bar during loading.
+    """
+    result: Dict[str, Dict[str, pd.DataFrame]] = {}
+    base = Path(base_path)
+    subdirs = [d for d in base.iterdir() if d.is_dir()]
+
+    dir_iter = tqdm(subdirs, desc="Loading CSV subfolders", unit="dir") if show_progress else subdirs
+    for subdir in dir_iter:
+        files_dict: Dict[str, pd.DataFrame] = {}
+        csv_files = list(subdir.glob(f"*{CSV_EXTENSION}"))
+        file_iter = tqdm(csv_files, desc=f"Reading CSVs in {subdir.name}", unit="file") if show_progress else csv_files
+        for file in file_iter:
+            try:
+                df = pd.read_csv(file)
+                files_dict[file.name] = df
+            except Exception as e:
+                print(f"Error reading CSV {file}: {e}")
+        result[subdir.name] = files_dict
+    return result
+
+
+
 import os
 import pandas as pd
 
-
-
-def load_csv_data(base_dir):
-    """
-    Lee todos los archivos CSV (terminan en _distance_table.csv) de cada subcarpeta en base_dir.
-    Retorna un diccionario: {subpop: {roi: dataframe, ...}, ...}
-    """
-    data_dict = {}
-    for subpop in os.listdir(base_dir):
-        subpop_path = os.path.join(base_dir, subpop)
-        if os.path.isdir(subpop_path):
-            data_dict[subpop] = {}
-            for file in os.listdir(subpop_path):
-                if file.endswith('_distance_table.csv'):
-                    roi = file.replace("roi_", "").replace("_distance_table.csv", "")
-                    file_path = os.path.join(subpop_path, file)
-                    try:
-                        df = pd.read_csv(file_path)
-                        data_dict[subpop][roi] = df
-                        print(f"CSV leído: {file_path}")
-                    except Exception as e:
-                        print(f"Error leyendo {file_path}: {e}")
-    return data_dict
-
-def load_csv_data2(base_dir):
-    """
-    Lee todos los archivos CSV (que terminan en _distance_table.csv) de cada subcarpeta en base_dir.
-    Retorna un diccionario anidado: {subpop: {roi: dataframe, ...}, ...}
-    """
-    data_dict = {}
-    for subpop_folder in os.listdir(base_dir):
-        subpop_path = os.path.join(base_dir, subpop_folder)
-        if os.path.isdir(subpop_path):
-            data_dict[subpop_folder] = {}
-            for file in os.listdir(subpop_path):
-                if file.endswith('_distance_table.csv'):
-                    roi = file.replace("roi_", "").replace("_distance_table.csv", "")
-                    file_path = os.path.join(subpop_path, file)
-                    try:
-                        df = pd.read_csv(file_path)
-                        data_dict[subpop_folder][roi] = df
-                        print(f"CSV leído correctamente: {file_path}")
-                    except Exception as e:
-                        print(f"Error al leer {file_path}: {e}")
-    return data_dict--------
+def load_distance_matrices(base_path):
+    dic_distancias = {}
+    for group in os.listdir(base_path):  # "A_neg", "A_pos"
+        path_group = os.path.join(base_path, group)
+        if not os.path.isdir(path_group): continue
+        files_dict = {}
+        # ahora iteramos también dentro de cada sub-subcarpeta:
+        for subpop in os.listdir(path_group):
+            path_subpop = os.path.join(path_group, subpop)
+            if not os.path.isdir(path_subpop): continue
+            for fname in os.listdir(path_subpop):
+                if fname.lower().endswith('.csv'):
+                    full = os.path.join(path_subpop, fname)
+                    files_dict[f"{subpop}/{fname}"] = pd.read_csv(full)
+        dic_distancias[group] = files_dict
+    return dic_distancias
+--------
 ./io/paths.py:
 --------
 ./io/__init__.py:
 --------
 ./preprocessing/segmentation.py:
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import tifffile
+from typing import Dict, Callable, List, Optional, Union
+from multiplex_pipeline.utils.helpers import extract_roi_number
+from skimage.morphology import remove_small_objects, remove_small_holes, binary_closing, disk
 
 
-
-def post_process_mask(mask, min_size=0, max_hole_size=10000):
+def post_process_mask(mask: np.ndarray, min_size: int = 0, max_hole_size: int = 10000) -> np.ndarray:
     """
-    Performs post-processing on a binary mask.
-    
-    Parameters:
-    - mask (np.ndarray): Binary mask to process.
-    - min_size (int): Minimum size of objects to retain.
-    - max_hole_size (int): Maximum size of holes to fill.
-    
-    Returns:
-    - np.ndarray: Post-processed mask.
+    Fill small holes and remove small objects from a binary mask.
     """
-
-    from skimage.morphology import remove_small_objects, remove_small_holes
-
-
-    # Ensure that the mask is of boolean type
-    mask = mask.astype(bool)
-    
-    # Fill small holes that are less than or equal to max_hole_size
+    mask_bool = mask.astype(bool)
     if max_hole_size > 0:
-        mask = remove_small_holes(mask, area_threshold=max_hole_size)
-        print(f"Holes smaller than or equal to {max_hole_size} pixels have been filled.")
-
-    # Remove small objects that are smaller than min_size
+        mask_bool = remove_small_holes(mask_bool, area_threshold=max_hole_size)
+        print(f"Holes ≤ {max_hole_size} px filled.")
     if min_size > 0:
-        mask = remove_small_objects(mask, min_size=min_size)
-        print(f"Objects smaller than {min_size} pixels have been removed.")
-    
-    return mask
+        mask_bool = remove_small_objects(mask_bool, min_size=min_size)
+        print(f"Objects < {min_size} px removed.")
+    return mask_bool
 
 
-
-def post_process_mask_closing(mask, min_size=0, max_hole_size=10000):
+def post_process_mask_closing(mask: np.ndarray, min_size: int = 0, max_hole_size: int = 10000) -> np.ndarray:
     """
-    Performs a large morphological closing on the binary mask.
-    This combines a dilation followed by an erosion to fill holes
-    and unify the mask.
+    Perform a large morphological closing to unify structures, ignoring size parameters.
     """
-    from skimage.morphology import binary_closing, disk
+    mask_bool = mask.astype(bool)
+    selem = disk(20)
+    closed = binary_closing(mask_bool, selem)
+    print(f"Performed closing (disk radius=20).")
+    return closed
 
-    # Convert mask to boolean
-    mask = mask.astype(bool)
-    
-    # Perform a "large" closing to fill holes and unify structures
-    selem = disk(20)  # Adjust the disk radius as needed
-    mask = binary_closing(mask, selem)
-    
-    return mask
 
---------
-./preprocessing/thresholding.py:
---------
+def generate_initial_mask(
+    channel_data: np.ndarray,
+    score: Union[Dict[str, float], float],
+    scaling_divisor: float
+) -> (np.ndarray, np.ndarray):
+    """
+    Compute initial binary mask by thresholding channel data.
+    Returns the raw channel and the binary initial mask.
+    """
+    m, s = channel_data.mean(), channel_data.std()
+    thresh = m + (score / scaling_divisor) * 3 * s
+    initial_mask = channel_data > thresh
+    return channel_data, initial_mask
+
+
+def apply_dapi_mask(
+    initial_mask: np.ndarray,
+    roi_num: str,
+    dapi_masks: Dict[str, np.ndarray],
+    require_dapi: bool,
+    name: str
+) -> Optional[np.ndarray]:
+    """
+    If require_dapi, intersect mask with DAPI ROI mask.
+    Returns None if DAPI mask is missing.
+    """
+    if require_dapi:
+        key = f"roi{roi_num}_dapi"
+        dmask = dapi_masks.get(key)
+        if dmask is None:
+            print(f"Skipping {name}: missing DAPI mask {key}")
+            return None
+        return initial_mask & (dmask > 0)
+    return initial_mask
+
+
+def save_mask(
+    mask: np.ndarray,
+    base_folder: str,
+    name: str,
+    roi_num: str,
+    filename: str
+) -> None:
+    """
+    Save binary mask to disk under a folder named '{name} - ROI{roi_num}'.
+    """
+    roi_folder = os.path.join(base_folder, f"{name} - ROI{roi_num}")
+    os.makedirs(roi_folder, exist_ok=True)
+    tifffile.imwrite(os.path.join(roi_folder, filename), mask.astype(np.uint8))
+    print(f"Saved: {os.path.join(roi_folder, filename)}")
+
+
+def display_masks(
+    channel: np.ndarray,
+    initial_mask: np.ndarray,
+    processed_mask: np.ndarray,
+    brightness_factor: Optional[float],
+    mask_label: str,
+    channel_index: int,
+    name: str,
+    min_size: int,
+    max_hole_size: int
+) -> None:
+    """
+    Plot the raw channel, initial mask, and post-processed mask side by side.
+    """
+    fig, axs = plt.subplots(1, 3, figsize=(18, 6))
+    disp = channel * brightness_factor if brightness_factor else channel
+    axs[0].imshow(np.clip(disp, 0, channel.max()), cmap='gray')
+    axs[0].set_title(f'{name}: {mask_label} (ch {channel_index})'); axs[0].axis('off')
+    axs[1].imshow(initial_mask, cmap='gray')
+    axs[1].set_title('Initial mask'); axs[1].axis('off')
+    axs[2].imshow(processed_mask, cmap='gray')
+    axs[2].set_title(f'Post-processed (min={min_size}, max_hole={max_hole_size})'); axs[2].axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+def create_channel_masks(
+    images_dict: Dict[str, np.ndarray],
+    dapi_masks_dict: Dict[str, np.ndarray],
+    channel_index: int,
+    user_scores: Union[Dict[str, float], float],
+    scaling_divisor: float,
+    base_folder_path: str,
+    min_size: int,
+    max_hole_size: int,
+    mask_label: str,
+    mask_filename: str,
+    post_process_funcs: List[Callable[[np.ndarray, int, int], np.ndarray]],
+    brightness_factor: Optional[float] = None,
+    require_dapi: bool = False
+) -> Dict[str, np.ndarray]:
+    """
+    Generate, post-process, save, and display channel masks.
+
+    Returns a dict of 'roi{n}' -> processed mask.
+    """
+    out_masks: Dict[str, np.ndarray] = {}
+
+    for name, image in images_dict.items():
+        roi_num = extract_roi_number(name)
+        if roi_num is None:
+            print(f"Skipping {name}: cannot extract ROI number.")
+            continue
+
+        # initial mask
+        chan = image[channel_index].astype(float)
+        score_val = user_scores[name] if isinstance(user_scores, dict) else user_scores
+        chan, initial_mask = generate_initial_mask(chan, score_val, scaling_divisor)
+
+        # apply DAPI
+        masked = apply_dapi_mask(initial_mask, roi_num, dapi_masks_dict, require_dapi, name)
+        if masked is None:
+            continue
+
+        # post-process
+        processed = masked.copy()
+        for fn in post_process_funcs:
+            processed = fn(processed, min_size=min_size, max_hole_size=max_hole_size)
+
+        # save and record
+        out_key = f"roi{roi_num}"
+        out_masks[out_key] = processed
+        save_mask(processed, base_folder_path, name, roi_num, mask_filename)
+
+        # display
+        display_masks(
+            chan,
+            masked,
+            processed,
+            brightness_factor,
+            mask_label,
+            channel_index,
+            name,
+            min_size,
+            max_hole_size
+        )
+
+    return out_masks--------
 ./preprocessing/__init__.py:
+--------
+./README.md:
 --------
 ./utils/helpers.py:
 def extract_roi_number(filename):
@@ -605,7 +1033,7 @@ from matplotlib.collections import PatchCollection
 import matplotlib.lines as mlines
 
 # Constantes que usas pero no defines aquí:
-from multiplex_pipeline.config import PIXEL_SIZE_MICROMETERS, MASK_ALPHA
+from multiplex_pipeline.config import PIXEL_SIZE, MASK_ALPHA
 
 # Funciones auxiliares que también debes importar si no están en este mismo módulo:
 from multiplex_pipeline.analysis.spatial import (
@@ -614,7 +1042,7 @@ from multiplex_pipeline.analysis.spatial import (
     compute_subpop_distances
 )
 
-from multiplex_pipeline.config import cnio_user
+from multiplex_pipeline.config import CNIO_USER
 import pandas as pd 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -1007,7 +1435,7 @@ def create_marker_plot(
         else:
             dist, idx = tree_neg.query(centroid) if tree_neg else (0.0, 0)
             near  = tuple(map(int, tree_neg.data[idx])) if tree_neg else centroid
-        dists.append(dist * PIXEL_SIZE_MICROMETERS)
+        dists.append(dist * PIXEL_SIZE)
         near_pts.append(near)
 
     sub_df = sub_df.copy()
@@ -1560,6 +1988,19 @@ def plot_subpopulations_and_distances(
 
     plt.show()
 
+import os
+from multiplex_pipeline.config import (
+    DISTANCES_POPULATIONS_DIR,
+    SUBPOPULATION_A_POSITIVE,
+    SUBPOPULATION_A_NEGATIVE,
+    SUBPOPULATIONS,
+    CONDITION_COLUMN_MAP,
+    SHADING_COLORS,
+    PIXEL_SIZE,
+    ROIS_TO_ANALYZE
+)
+
+# Ruta de guardado ajustada para evitar la creación de carpetas padre
 def compute_and_plot_subpop_distances_for_all_rois(
     rois,
     subpop_conditions_A,
@@ -1572,58 +2013,28 @@ def compute_and_plot_subpop_distances_for_all_rois(
     masks_to_shade=None,
     shading_dict=None,
     save_matrix_as_csv=False,
-    path_save="..\\results_spatial_analysis\\"+cnio_user+"\\distances_between_populations",
+    path_save="..\\results_spatial_analysis\\" + CNIO_USER + "\\distances_between_populations",
     print_pivot_head=False,
     plot_type="line",
-    subpopB_label=None  # Nuevo parámetro opcional
+    subpopB_label=None  # Parámetro opcional
 ):
     """
-    For each ROI in 'rois':
-      1) Parse subpop A conditions and subpop B conditions.
-      2) Find subpop A / subpop B within that ROI.
-      3) Compute all distances between every cell in A and every cell in B.
-      4) Create a pivot table (rows = A_roi_cell, columns = B_roi_cell).
-      5) Optionally print the first 10 rows of the pivot table if print_pivot_head=True.
-      6) Optionally save the pivot table as CSV if save_matrix_as_csv=True.
-      7) Plot each ROI, shading selected masks, and show subpopulations plus lines
-         (A->B and B->A) or Voronoi diagrams based on the specified plot_type.
-
-    Parameters
-    ----------
-    rois : list of str
-        List of Regions of Interest identifiers.
-    subpop_conditions_A : list of str
-        List of conditions for subpopulation A.
-    subpop_conditions_B : list of str
-        List of conditions for subpopulation B.
-    df_binary : DataFrame
-        DataFrame containing binary data for cells.
-    dapi_masks_dict : dict
-        Dictionary of DAPI masks by ROI.
-    condition_column_map : dict
-        Mapping from condition names to DataFrame column names.
-    pixel_size : float, optional
-        Size of a pixel in micrometers.
-    max_pairs : int, optional
-        Maximum number of pairs to plot. If None, all pairs are plotted.
-    masks_to_shade : list of str, optional
-        List of mask names to overlay on the plot.
-    shading_dict : dict, optional
-        Dictionary mapping mask names to their data and colors.
-    save_matrix_as_csv : bool, optional
-        Whether to save the distance matrix as a CSV file.
-    print_pivot_head : bool, optional
-        Whether to print the first 10 rows of the pivot table.
-    plot_type : str, optional
-        Type of visualization: "line" or "voronoi".
-
-    Returns
-    -------
-    all_distances : dict
-        Dictionary of DataFrames, one per ROI, containing all pairwise distances.
+    Para cada ROI en 'rois':
+      1) Parsea las condiciones de subpoblación A y B.
+      2) Encuentra las celdas de A y B dentro de ese ROI.
+      3) Calcula todas las distancias entre cada celda de A y cada celda de B.
+      4) Crea una tabla dinámica (filas = celdas de A, columnas = celdas de B).
+      5) Imprime opcionalmente las primeras 10 filas de la tabla dinámica.
+      6) Guarda opcionalmente la tabla dinámica como CSV.
+      7) Grafica cada ROI, sombreando las máscaras seleccionadas y mostrando las subpoblaciones más líneas
+         (A->B y B->A) o diagramas de Voronoi según el tipo de gráfico especificado.
     """
-    subpopA_name = " & ".join(subpop_conditions_A)
-    subpopB_name = subpopB_label if subpopB_label is not None else " & ".join(subpop_conditions_B)
+
+    # Define el nombre de la subpoblación de A y B
+    subpopA_name = "_".join(subpop_conditions_A)  # Aquí usamos un solo nombre simplificado
+    subpopB_name = subpopB_label if subpopB_label is not None else "_".join(subpop_conditions_B)  # De igual manera para B
+    
+    # Parseamos las condiciones
     parsedA = parse_conditions(subpop_conditions_A, condition_column_map)
     parsedB = parse_conditions(subpop_conditions_B, condition_column_map)
 
@@ -1636,32 +2047,32 @@ def compute_and_plot_subpop_distances_for_all_rois(
             print(f"Missing DAPI mask for {dapi_key}. Skipping.")
             continue
 
-        # Extract the labeled DAPI mask
+        # Extraemos la máscara de DAPI etiquetada
         dapi_mask = dapi_masks_dict[dapi_key]
 
-        # Filter df_binary for this ROI
+        # Filtramos df_binary para este ROI
         df_roi = df_binary[df_binary['ROI'] == roi].copy()
 
-        # Merge with centroids
+        # Fusionamos con los centroides
         centroids_df = get_centroids(dapi_mask)
         df_roi = pd.merge(df_roi, centroids_df, on='DAPI_ID', how='left')
 
-        # Select subpopulations
+        # Seleccionamos las subpoblaciones
         subpopA = select_subpopulation(df_roi, parsedA)
         subpopB = select_subpopulation(df_roi, parsedB)
 
-        # Compute all distances
+        # Calculamos todas las distancias
         dist_df = compute_subpop_distances(subpopA, subpopB)
         if dist_df.empty:
             print(f"No distances to compute for {roi} (subpopulation A or B is empty).")
             all_distances[roi] = dist_df
-            continue  # Skip to next ROI      
+            continue  # Saltamos al siguiente ROI      
         dist_df['ROI'] = roi
         dist_df['distance_um'] = dist_df['distance_px'] * pixel_size
 
         all_distances[roi] = dist_df
 
-        # Create pivot table
+        # Creamos la tabla dinámica
         dist_df['A_roi_cell'] = dist_df['ROI'].astype(str) + "_" + dist_df['A_cell_id'].astype(str)
         dist_df['B_roi_cell'] = dist_df['ROI'].astype(str) + "_" + dist_df['B_cell_id'].astype(str)
 
@@ -1677,23 +2088,15 @@ def compute_and_plot_subpop_distances_for_all_rois(
             print(distance_matrix.head(10))
 
         if save_matrix_as_csv:
-            # Create the filename
+            # Ruta de guardado con subpoblación A y B combinadas sin subdirectorios innecesarios
             csv_filename = f"distance_matrix_{roi}_{subpopA_name}_vs_{subpopB_name}.csv"
-            
-            # Ensure the directory exists
-            if path_save and not os.path.exists(path_save):
-                os.makedirs(path_save)
-            
-            # Construct the full file path
-            csv_filepath = os.path.join(path_save, csv_filename)
-            
-            # Save the DataFrame as CSV
+            csv_filepath = os.path.join(path_save, csv_filename)  # Guardar en una única carpeta combinada
             distance_matrix.to_csv(csv_filepath, index=True)
             print(f"Matrix saved as CSV: {csv_filepath}")
 
-        # Plot only if both subpopulations have cells
+        # Graficar solo si ambas subpoblaciones tienen celdas
         if len(subpopA) > 0 and len(subpopB) > 0:
-            # Define the plot filename
+            # Definir la ruta para el gráfico (formato SVG)
             plot_filename = os.path.join(
                 path_save,
                 f"plot_{roi}_{subpopA_name}_vs_{subpopB_name}.svg"
@@ -1711,17 +2114,27 @@ def compute_and_plot_subpop_distances_for_all_rois(
                 shading_dict=shading_dict,
                 pixel_size=pixel_size,
                 max_pairs=max_pairs,
-                plot_type=plot_type,  # Pass the plot_type parameter
-                save_plot=True,       # Enable plot saving
-                plot_filename=plot_filename  # Provide the plot filename
+                plot_type=plot_type,  # Pasar el parámetro plot_type
+                save_plot=True,       # Habilitar la opción de guardar el gráfico
+                plot_filename=plot_filename  # Pasar el nombre del archivo de gráfico
             )
         else:
             print(f"One or both subpopulations are empty in {roi}. No plot.")
 
     return all_distances
-
 --------
 ./visualization/qc.py:
+
+import os
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from typing import Dict, Callable, List, Tuple
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+import matplotlib.patches as mpatches
+import re
+
 def plot_masks(dapi_masks_dict):
     import numpy as np 
     from matplotlib.colors import ListedColormap
@@ -1747,309 +2160,351 @@ def plot_masks(dapi_masks_dict):
         # Print statistics
         print(f"Number of unique labels in {extracted_name} (excluding background): {num_labels - 1}")
 
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+import matplotlib.patches as mpatches
 
-def generate_boxplots_by_subpop(subpop_name, roi_data, positive_col, negative_col, marker_label):
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+import matplotlib.patches as mpatches
+
+def generate_boxplots_nested(
+    nested_data: dict[str, dict[str, pd.DataFrame]],
+    positive_col: str,
+    negative_col: str,
+    label: str,
+    output_dir: str,
+    prefix: str
+):
     """
-    Genera un boxplot combinado de distancias positivas y negativas para cada ROI de una subpoblación.
-    La figura tendrá de título la subpoblación y el eje x mostrará los nombres de ROI (spliteados).
+    Modo: mask↔subpop: cada df tiene positive_col & negative_col → varios ROIs, dos violines+boxplots
     """
-    import numpy as np 
-    import matplotlib.pyplot as plt
-    from matplotlib.ticker import FuncFormatter
-    import matplotlib.patches as mpatches
+    os.makedirs(output_dir, exist_ok=True)
 
-    try:
-        print(f"\nGenerando boxplot para subpoblación: {subpop_name}")
-        
-        # Ordena ROIs y prepara datos (filtrando ceros)
-        roi_names = sorted(roi_data.keys())
-        pos_data, neg_data = [], []
-        for roi in roi_names:
-            try:
-                print(f"Procesando ROI: {roi}")
-                df = roi_data[roi]
-                pos_vals = df[positive_col][df[positive_col] != 0].tolist()
-                neg_vals = df[negative_col][df[negative_col] != 0].tolist()
-                
-                if len(pos_vals) == 0:
-                    print(f"Advertencia: Lista positiva vacía en {roi}; se inserta NaN")
-                    pos_vals = [float('nan')]
-                elif len(pos_vals) == 1:
-                    print(f"Advertencia: Un solo valor positivo en {roi}; duplicándolo")
-                    pos_vals *= 2
-                
-                if len(neg_vals) == 0:
-                    print(f"Advertencia: Lista negativa vacía en {roi}; se inserta NaN")
-                    neg_vals = [float('nan')]
-                elif len(neg_vals) == 1:
-                    print(f"Advertencia: Un solo valor negativo en {roi}; duplicándolo")
-                    neg_vals *= 2
+    for key1, subdict in nested_data.items():
+        df0 = next(iter(subdict.values()))
+        keys = set(subdict.keys())
 
-                pos_data.append(pos_vals)
-                neg_data.append(neg_vals)
-            except Exception as e:
-                print(f"Error procesando ROI {roi}: {e}")
-        
-        # Crear figura y eje
-        try:
-            fig, ax = plt.subplots(figsize=(12, 8))
-            print("Figura y eje creados")
-        except Exception as e:
-            print(f"Error al crear figura: {e}")
-            return None
-        
-        positions = list(range(1, len(roi_names) + 1))
-        
-        # Configuración según marker_label
-        if marker_label.lower() == "ck":
-            top_title = "Cell to Tumor Distances"
-            bottom_title = "Cell to Stroma Distances"
-            pos_color = "lightcoral"
-            neg_color = "lightblue"
-        else:
-            top_title = f"Cell to {marker_label} Positive Distances"
-            bottom_title = f"Cell to {marker_label} Negative Distances"
-            pos_color = "violet"
-            neg_color = "skyblue"
-        
-        offset = 0.2
-        pos_positions = [p - offset for p in positions]
-        neg_positions = [p + offset for p in positions]
-        
-        # Trazar datos positivos
-        try:
-            vp_pos = ax.violinplot(
-                pos_data, positions=pos_positions, widths=0.4,
-                showmeans=False, showmedians=False, showextrema=False
-            )
-            for body in vp_pos['bodies']:
-                body.set_facecolor(pos_color)
-                body.set_edgecolor('black')
-                body.set_alpha(0.5)
-            bp_pos = ax.boxplot(
-                pos_data, positions=pos_positions, widths=0.15,
-                patch_artist=True, showfliers=False
-            )
-            for box in bp_pos['boxes']:
-                box.set_facecolor('white')
-                box.set_edgecolor('black')
-            for median in bp_pos['medians']:
-                median.set_color('black')
-            print("Datos positivos trazados")
-        except Exception as e:
-            print(f"Error trazando datos positivos: {e}")
-        
-        # Trazar datos negativos
-        try:
-            vp_neg = ax.violinplot(
-                neg_data, positions=neg_positions, widths=0.4,
-                showmeans=False, showmedians=False, showextrema=False
-            )
-            for body in vp_neg['bodies']:
-                body.set_facecolor(neg_color)
-                body.set_edgecolor('black')
-                body.set_alpha(0.5)
-            bp_neg = ax.boxplot(
-                neg_data, positions=neg_positions, widths=0.15,
-                patch_artist=True, showfliers=False
-            )
-            for box in bp_neg['boxes']:
-                box.set_facecolor('white')
-                box.set_edgecolor('black')
-            for median in bp_neg['medians']:
-                median.set_color('black')
-            print("Datos negativos trazados")
-        except Exception as e:
-            print(f"Error trazando datos negativos: {e}")
-        
-        # Etiquetas, título y leyenda
-        try:
-            ax.set_ylabel("Distance (µm)")
-            ax.set_title(f"{top_title} vs {bottom_title}", pad=15)
-            # Se splittea cada ROI para mejorar la lectura en el eje x
-            xlabels = [" ".join(roi.split('_')) for roi in roi_names]
+        # --- MODO: mask↔subpop (múltiples ROIs) ---
+        if positive_col in df0.columns and negative_col in df0.columns:
+            names2 = sorted(subdict.keys())
+            pos_data = []; neg_data = []
+            for roi in names2:
+                df = subdict[roi]
+                p = df[positive_col][df[positive_col] != 0].tolist() or [np.nan]
+                n = df[negative_col][df[negative_col] != 0].tolist() or [np.nan]
+                if len(p) == 1: p *= 2
+                if len(n) == 1: n *= 2
+                pos_data.append(p); neg_data.append(n)
+
+            fig, ax = plt.subplots(figsize=(10, 6))
+            positions = np.arange(1, len(names2) + 1)
+            off = 0.2
+            vp1 = ax.violinplot(pos_data, positions=positions - off, widths=0.35,
+                                showmeans=False, showmedians=False, showextrema=False)
+            for b in vp1['bodies']:
+                b.set_facecolor('lightcoral'); b.set_edgecolor('black'); b.set_alpha(0.5)
+            ax.boxplot(pos_data, positions=positions - off, widths=0.15,
+                       patch_artist=True, showfliers=False,
+                       boxprops=dict(facecolor='white', edgecolor='black'))
+
+            vp2 = ax.violinplot(neg_data, positions=positions + off, widths=0.35,
+                                showmeans=False, showmedians=False, showextrema=False)
+            for b in vp2['bodies']:
+                b.set_facecolor('lightblue'); b.set_edgecolor('black'); b.set_alpha(0.5)
+            ax.boxplot(neg_data, positions=positions + off, widths=0.15,
+                       patch_artist=True, showfliers=False,
+                       boxprops=dict(facecolor='white', edgecolor='black'))
+
             ax.set_xticks(positions)
-            ax.set_xticklabels(xlabels, rotation=45)
+            ax.set_xticklabels(names2, rotation=45, ha='right')
+            patch_pos = mpatches.Patch(color='lightcoral', label=f"{label}+")
+            patch_neg = mpatches.Patch(color='lightblue', label=f"{label}-")
+            ax.legend(handles=[patch_pos, patch_neg], loc="best")
+            title = f"{key1} ➞ {label}+ vs {label}-"
+
+        # --- MODO 3: pivot genérico ---
+        else:
+            vals = []
+            for df in subdict.values():
+                nums = df.select_dtypes(include=[np.number]).values.flatten()
+                nums = nums[nums != 0]
+                if nums.size == 0: nums = np.array([np.nan])
+                vals.extend(nums.tolist())
+            if len(vals) == 1: vals *= 2
+
+            fig, ax = plt.subplots(figsize=(6, 6))
+            vp = ax.violinplot([vals], positions=[1], widths=0.6,
+                               showmeans=False, showmedians=False, showextrema=False)
+            for b in vp['bodies']:
+                b.set_facecolor('skyblue'); b.set_edgecolor('black'); b.set_alpha(0.5)
+            ax.boxplot([vals], positions=[1], widths=0.2,
+                       patch_artist=True, showfliers=False,
+                       boxprops=dict(facecolor='white', edgecolor='black'))
+
+            ax.set_xticks([1])
+            ax.set_xticklabels([key1], rotation=45, ha='right')
+            ax.legend(handles=[mpatches.Patch(color='skyblue', label=label)], loc="best")
+            title = f"{key1} ➞ {label} distances"
+
+        # — Etiquetas y escala sólo si hay >0 —
+        # recolectar todos los datos para este gráfico
+        all_vals = []
+        if positive_col in df0.columns and negative_col in df0.columns:
+            all_vals = sum(pos_data + neg_data, [])
+        else:
+            all_vals = vals
+
+        # filtrar NaNs
+        all_vals = [v for v in all_vals if np.isfinite(v)]
+        if any(v > 0 for v in all_vals):
             ax.set_yscale("log")
-            ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f'{y:.0f}'))
+
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f"{y:.0f}"))
+        ax.set_ylabel("Distance (µm)")
+        ax.set_title(title, pad=15)
+
+        fig.tight_layout(rect=[0, 0, 1, 0.92])
+
+        # Guardar
+        f = os.path.join(output_dir, f"{prefix}_{key1}.svg")
+        fig.savefig(f)
+        print("Guardado:", f)
+
+        plt.show()
+        plt.close(fig)
+
+from multiplex_pipeline.config import (
+    CNIO_USER, 
+    RESULTS_BASE_DIR, 
+    DISTANCES_POPULATIONS_DIR, 
+    BOXPLOTS_DISTANCES_HEATMAPS_DIR
+)
+
+def generate_combined_boxplots(dic_distancias, save_path=BOXPLOTS_DISTANCES_HEATMAPS_DIR):
+    out_dir = os.path.join(save_path)
+    os.makedirs(out_dir, exist_ok=True)
+
+    pop_dict = {}
+    for _, files in dic_distancias.items():
+        for fname, df in files.items():
+            m = re.match(r"(distance_matrix_(roi\d+)_.*NGFR_intensity)([\+\-])(_vs.*)\.csv", fname)
+            if not m:
+                continue
+            roi, sign = m.group(2), m.group(3)
+            pop = (m.group(1).replace(f"distance_matrix_{roi}_", "") + m.group(4))
+            arr = pd.to_numeric(df.values.flatten(), errors='coerce')
+            arr = arr[~np.isnan(arr)]
+            pop_dict.setdefault(pop, {}).setdefault(roi, {})['plus' if sign == '+' else 'minus'] = arr
+
+    c_plus, c_minus = 'lightgreen', 'lightcoral'
+
+    for pop, rois in pop_dict.items():
+        sorted_rois = sorted(rois, key=lambda x: int(re.findall(r'\d+', x)[0]))
+        fig, ax = plt.subplots(figsize=(8, 5))
+        pos_plus, data_plus = [], []
+        pos_minus, data_minus = [], []
+
+        for i, roi in enumerate(sorted_rois):
+            d = rois[roi]
+            if 'plus' in d and 'minus' in d:
+                pos_plus.append(3 * i + 1)
+                data_plus.append(d['plus'])
+                pos_minus.append(3 * i + 2)
+                data_minus.append(d['minus'])
+
+        # Solo procedemos si hay datos válidos en las listas
+        if data_plus and data_minus:
+            bp1 = ax.boxplot(data_plus, positions=pos_plus, patch_artist=True, widths=0.6, showfliers=False)
+            bp2 = ax.boxplot(data_minus, positions=pos_minus, patch_artist=True, widths=0.6, showfliers=False)
+
+            for b in bp1['boxes']:
+                b.set(facecolor=c_plus, alpha=0.5)
+            for b in bp2['boxes']:
+                b.set(facecolor=c_minus, alpha=0.5)
+
+            vp1 = ax.violinplot(data_plus, positions=pos_plus, widths=0.6, showextrema=False)
+            vp2 = ax.violinplot(data_minus, positions=pos_minus, widths=0.6, showextrema=False)
+
+            for v in vp1['bodies']:
+                v.set_facecolor(c_plus)
+                v.set_edgecolor('black')
+                v.set_alpha(0.5)
+            for v in vp2['bodies']:
+                v.set_facecolor(c_minus)
+                v.set_edgecolor('black')
+                v.set_alpha(0.5)
+
+            centers, labels = [], []
+            for i, roi in enumerate(sorted_rois):
+                if 'plus' in rois[roi] and 'minus' in rois[roi]:
+                    centers.append((3 * i + 1 + 3 * i + 2) / 2)
+                    labels.append(roi)
+            ax.set_xticks(centers)
+            ax.set_xticklabels(labels)
+            ax.set_ylabel("Distance [µm]")
+            pop_name = re.search(r'vs_(.*)', pop).group(1).replace("_", " ") if re.search(r'vs_(.*)', pop) else pop
+            ax.set_title(f"Distances tumor vs {pop_name}")
+            ax.legend([mpatches.Patch(facecolor=c_plus), mpatches.Patch(facecolor=c_minus)], ['NGFR+', 'NGFR−'], loc='upper right')
             
-            if marker_label.lower() == "ck":
-                pos_label = "Cell to Tumor"
-                neg_label = "Cell to Stroma"
-            else:
-                pos_label = f"Cell to {marker_label} Positive"
-                neg_label = f"Cell to {marker_label} Negative"
-            pos_patch = mpatches.Patch(color=pos_color, label=pos_label)
-            neg_patch = mpatches.Patch(color=neg_color, label=neg_label)
-            ax.legend(handles=[pos_patch, neg_patch], loc='best')
-            print("Etiquetas y leyenda configuradas")
-        except Exception as e:
-            print(f"Error configurando etiquetas: {e}")
-        
-        try:
-            fig.tight_layout(rect=[0, 0, 1, 0.88])
-            print("Layout ajustado")
-        except Exception as e:
-            print(f"Error ajustando layout: {e}")
-        
-        print(f"Boxplot generado para subpoblación: {subpop_name}")
-        return fig
-    except Exception as e:
-        print(f"Error general en generate_boxplots_by_subpop para {subpop_name}: {e}")
-        return None
-
-
-def generate_boxplots_by_roi(roi_name, subpop_data_for_roi, positive_col, negative_col, marker_label):
-    """
-    Genera un boxplot combinado de distancias positivas y negativas para cada subpoblación.
-    Se agregan múltiples bloques try/except y mensajes de depuración para evitar que se detenga la ejecución.
-    """
-    import numpy as np
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-    from matplotlib.ticker import FuncFormatter
-
-    try:
-        print(f"\nGenerando boxplot para ROI: {roi_name}")
-        import numpy as np
-        import matplotlib.patches as mpatches
-
-        # Ordena subpoblaciones y prepara listas de datos (filtrando ceros)
-        subpops = sorted(subpop_data_for_roi.keys())
-        pos_data = []
-        neg_data = []
-        for subpop in subpops:
-            try:
-                print(f"Procesando subpoblación: {subpop}")
-                df = subpop_data_for_roi[subpop]
-                pos_values = df[positive_col][df[positive_col] != 0].tolist()
-                neg_values = df[negative_col][df[negative_col] != 0].tolist()
-                
-                if len(pos_values) == 0:
-                    print(f"Advertencia: Lista positiva vacía en {subpop}; se inserta NaN")
-                    pos_values = [float('nan')]
-                elif len(pos_values) == 1:
-                    print(f"Advertencia: Un solo valor positivo en {subpop}; duplicándolo")
-                    pos_values = pos_values * 2
-                
-                if len(neg_values) == 0:
-                    print(f"Advertencia: Lista negativa vacía en {subpop}; se inserta NaN")
-                    neg_values = [float('nan')]
-                elif len(neg_values) == 1:
-                    print(f"Advertencia: Un solo valor negativo en {subpop}; duplicándolo")
-                    neg_values = neg_values * 2
-
-                pos_data.append(pos_values)
-                neg_data.append(neg_values)
-            except Exception as e:
-                print(f"Error procesando subpoblación {subpop}: {e}")
-        
-        # Crear figura y eje
-        try:
-            fig, ax = plt.subplots(1, 1, figsize=(12, 8))
-            print("Figura y eje creados correctamente")
-        except Exception as e:
-            print(f"Error al crear la figura: {e}")
-            return None
-        
-        positions = list(range(1, len(subpops) + 1))
-        
-        # Configuración según marker_label
-        if marker_label.lower() == "ck":
-            top_title = "Cell to Tumor Distances"
-            bottom_title = "Cell to Stroma Distances"
-            pos_color = "lightcoral"
-            neg_color = "lightblue"
+            plt.tight_layout()
+            safe = re.sub(r'[^\w\-_\. ]', '_', pop_name)
+            plt.savefig(os.path.join(out_dir, f"{safe}.svg"), format='svg')
+            plt.show()
+            plt.close(fig)
         else:
-            top_title = f"Cell to {marker_label} Positive Distances"
-            bottom_title = f"Cell to {marker_label} Negative Distances"
-            pos_color = "violet"
-            neg_color = "skyblue"
-        
-        offset = 0.2
-        pos_positions = [p - offset for p in positions]
-        neg_positions = [p + offset for p in positions]
-        
-        # Trazado de datos positivos
-        try:
-            vp_pos = ax.violinplot(
-                pos_data, positions=pos_positions, widths=0.4,
-                showmeans=False, showmedians=False, showextrema=False
-            )
-            for body in vp_pos['bodies']:
-                body.set_facecolor(pos_color)
-                body.set_edgecolor('black')
-                body.set_alpha(0.5)
-            bp_pos = ax.boxplot(
-                pos_data, positions=pos_positions, widths=0.15,
-                patch_artist=True, showfliers=False
-            )
-            for box in bp_pos['boxes']:
-                box.set_facecolor('white')
-                box.set_edgecolor('black')
-            for median in bp_pos['medians']:
-                median.set_color('black')
-            print("Datos positivos trazados correctamente")
-        except Exception as e:
-            print(f"Error al trazar datos positivos: {e}")
-        
-        # Trazado de datos negativos
-        try:
-            vp_neg = ax.violinplot(
-                neg_data, positions=neg_positions, widths=0.4,
-                showmeans=False, showmedians=False, showextrema=False
-            )
-            for body in vp_neg['bodies']:
-                body.set_facecolor(neg_color)
-                body.set_edgecolor('black')
-                body.set_alpha(0.5)
-            bp_neg = ax.boxplot(
-                neg_data, positions=neg_positions, widths=0.15,
-                patch_artist=True, showfliers=False
-            )
-            for box in bp_neg['boxes']:
-                box.set_facecolor('white')
-                box.set_edgecolor('black')
-            for median in bp_neg['medians']:
-                median.set_color('black')
-            print("Datos negativos trazados correctamente")
-        except Exception as e:
-            print(f"Error al trazar datos negativos: {e}")
-        
-        # Configuración de etiquetas, títulos y leyenda
-        try:
-            ax.set_ylabel("Distance (µm)")
-            ax.set_title(f"{top_title} vs {bottom_title}", pad=15)
-            ax.set_xticks(positions)
-            ax.set_xticklabels(subpops, rotation=45)
-            ax.set_yscale("log")
-            ax.yaxis.set_major_formatter(FuncFormatter(lambda y, _: f'{y:.0f}'))
+            print(f"Advertencia: No se encontraron datos válidos para la subpoblación {pop}.")
+    
+    # Generación de gráficos por ROI
+    roi_dict = {}
 
-            if marker_label.lower() == "ck":
-                pos_label = "Cell to Tumor"
-                neg_label = "Cell to Stroma"
-            else:
-                pos_label = f"Cell to {marker_label} Positive"
-                neg_label = f"Cell to {marker_label} Negative"
-            pos_patch = mpatches.Patch(color=pos_color, label=pos_label)
-            neg_patch = mpatches.Patch(color=neg_color, label=neg_label)
-            ax.legend(handles=[pos_patch, neg_patch], loc='best')
-            print("Etiquetas y leyenda configuradas")
-        except Exception as e:
-            print(f"Error al configurar etiquetas y leyenda: {e}")
-        
-        try:
-            fig.tight_layout(rect=[0, 0, 1, 0.88])
-            print("Layout ajustado")
-        except Exception as e:
-            print(f"Error al ajustar el layout: {e}")
-        
-        print(f"Boxplot generado para ROI: {roi_name}")
-        return fig
-    except Exception as e:
-        print(f"Error general en generate_boxplots_by_roi para ROI {roi_name}: {e}")
-        return None
-        --------
+    for pop, rois in pop_dict.items():
+        for roi, d in rois.items():
+            roi_dict.setdefault(roi, {})[pop] = d
+
+    c_plus, c_minus = 'lightgreen', 'lightcoral'
+    for roi, pops in roi_dict.items():
+        sorted_pops = sorted(pops)
+        fig, ax = plt.subplots(figsize=(10, 6))
+        pos_plus, data_plus = [], []
+        pos_minus, data_minus = [], []
+
+        for i, pop in enumerate(sorted_pops):
+            d = pops[pop]
+            if 'plus' in d and 'minus' in d:
+                pos_plus.append(3 * i + 1)
+                pos_minus.append(3 * i + 2)
+                data_plus.append(d['plus'])
+                data_minus.append(d['minus'])
+
+        # Asegurarse de que haya datos antes de procesar
+        if data_plus and data_minus:
+            bp1 = ax.boxplot(data_plus, positions=pos_plus, patch_artist=True, widths=0.6, showfliers=False)
+            bp2 = ax.boxplot(data_minus, positions=pos_minus, patch_artist=True, widths=0.6, showfliers=False)
+
+            for b in bp1['boxes']:
+                b.set(facecolor=c_plus, alpha=0.5)
+            for b in bp2['boxes']:
+                b.set(facecolor=c_minus, alpha=0.5)
+
+            vp1 = ax.violinplot(data_plus, positions=pos_plus, widths=0.6, showextrema=False)
+            vp2 = ax.violinplot(data_minus, positions=pos_minus, widths=0.6, showextrema=False)
+
+            for v in vp1['bodies']:
+                v.set_facecolor(c_plus)
+                v.set_edgecolor('black')
+                v.set_alpha(0.5)
+            for v in vp2['bodies']:
+                v.set_facecolor(c_minus)
+                v.set_edgecolor('black')
+                v.set_alpha(0.5)
+        else:
+            print(f"Advertencia: No se encontraron datos válidos para el ROI {roi}.")
+            continue
+
+        centers = [(3 * i + 1 + 3 * i + 2) / 2 for i in range(len(sorted_pops))]
+        ax.set_xticks(centers)
+        ax.set_xticklabels([pop.replace("_", " ") for pop in sorted_pops], rotation=90, ha='center')
+        ax.set_ylabel("Distance [µm]")
+        ax.set_title(f"Distances for ROI {roi}")
+        ax.legend([mpatches.Patch(facecolor=c_plus), mpatches.Patch(facecolor=c_minus)], ['NGFR+', 'NGFR−'], loc='upper right')
+        plt.tight_layout()
+        safe = re.sub(r'[^\w\-_\. ]', '_', roi)
+        plt.savefig(os.path.join(out_dir, f"{safe}.svg"), format='svg')
+        plt.show()
+        plt.close(fig)
+
+
+
+
+def plot_combination_counts(
+    df: pd.DataFrame,
+    rois: List[str],
+    combinations: Dict[str, Callable[[pd.DataFrame], pd.Series]],
+    output_dir: str,
+    base_filename: str,
+    plot_title: str,
+    figsize: Tuple[int,int] = (20, 10),
+    rotation: int = 45,
+    font_scale: float = 1.0
+) -> pd.DataFrame:
+    """
+    Filtra `df` por ROIs, cuenta para cada ROI el número de True en cada condición de `combinations`,
+    guarda la tabla de counts como CSV en output_dir/{base_filename}.csv,
+    genera un barplot apilado con escala log y guarda como SVG en output_dir/{base_filename}.svg,
+    y retorna el DataFrame de counts.
+    """
+    # 1. Filtrado
+    filtered = df[df['ROI'].isin(rois)]
+
+    # 2–5. Cálculo de counts_df
+    counts_df = pd.DataFrame()
+    grouped = filtered.groupby('ROI')
+    for name, cond in combinations.items():
+        counts_df[name] = grouped.apply(lambda x: cond(x).sum())
+    counts_df = counts_df.reset_index()
+    counts_df['Total Cells'] = grouped.size().values
+
+    # 6–7. Melt para plot
+    counts_melted = counts_df.melt(
+        id_vars=['ROI','Total Cells'],
+        var_name='Combination',
+        value_name='Count'
+    )
+
+    # 8–9. Directorio de salida
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 10–13. Guardar CSV
+    csv_path = os.path.join(output_dir, f"{base_filename}.csv")
+    counts_df.to_csv(csv_path, index=False)
+    print(f"Table saved as CSV at: {csv_path}")
+
+    # 14. Plot
+    plt.figure(figsize=figsize)
+    sns.set_context("talk", font_scale=font_scale)
+    ax = sns.barplot(
+        x='ROI', y='Count', hue='Combination',
+        data=counts_melted
+    )
+    # anotar encima de cada barra
+    for p in ax.patches:
+        h = p.get_height()
+        if pd.notnull(h) and h > 0:
+            ax.text(
+                p.get_x() + p.get_width()/2,
+                h + 0.1,
+                f"{int(h)}",
+                ha='center', va='bottom', fontsize=10, rotation=90
+            )
+    # total en etiquetas x
+    new_lbls = [
+        f"{roi}\n(Total: {tot})"
+        for roi, tot in zip(counts_df['ROI'], counts_df['Total Cells'])
+    ]
+    ax.set_xticklabels(new_lbls, rotation=rotation)
+    ax.set_yscale('log')
+    ax.set_title(plot_title, fontsize=16)
+    ax.set_xlabel('ROI', fontsize=14)
+    ax.set_ylabel('Number of Positive Cells', fontsize=14)
+    ax.legend(title='Combination', fontsize=12, title_fontsize=14)
+    plt.tight_layout()
+
+    # 15. Guardar SVG
+    svg_path = os.path.join(output_dir, f"{base_filename}.svg")
+    plt.savefig(svg_path, format='svg', bbox_inches='tight')
+    print(f"Plot saved as SVG at: {svg_path}")
+
+    # 16. Mostrar
+    plt.show()
+
+    return counts_df--------
 ./visualization/__init__.py:
 --------
 ./__init__.py:

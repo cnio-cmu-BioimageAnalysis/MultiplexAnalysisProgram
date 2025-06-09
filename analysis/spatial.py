@@ -1,271 +1,230 @@
 import os
 import numpy as np
 import pandas as pd
-from multiplex_pipeline.config import PIXEL_SIZE, PIXEL_AREA
-
 from scipy.spatial import cKDTree
 from skimage.measure import regionprops
+from multiplex_pipeline.config import PIXEL_SIZE, PIXEL_AREA
 
-
-def compute_mask_area_summary(ck_masks, ngfr_masks, pixel_area=PIXEL_AREA):
+def compute_mask_area_summary(
+    ck_masks: dict, 
+    ngfr_masks: dict, 
+    pixel_area: float = PIXEL_AREA
+) -> pd.DataFrame:
     """
     Computes the area summary for each ROI based on CK and NGFR masks.
+
+    Args:
+        ck_masks (dict): Dictionary of CK masks for each ROI.
+        ngfr_masks (dict): Dictionary of NGFR masks for each ROI.
+        pixel_area (float, optional): Area of each pixel in µm². Defaults to PIXEL_AREA.
+
+    Returns:
+        pd.DataFrame: DataFrame with columns ['ROI', 'CK_Positive_Area_um2', 
+        'CK_NGFR_Positive_Area_um2', 'total_area_roi_um2'] representing area data for each ROI.
     """
     data = []
-    
     for roi in ck_masks:
-        ck_mask = ck_masks.get(roi, None)
-        ngfr_mask = ngfr_masks.get(roi, None)
+        ck_mask = ck_masks.get(roi)
+        ngfr_mask = ngfr_masks.get(roi)
         
-        if ck_mask is None or ngfr_mask is None:
-            print(f"CK or NGFR mask for ROI '{roi}' not found. Skipping.")
-            continue
-        
-        if ck_mask.shape != ngfr_mask.shape:
-            print(f"Mask shapes do not match for ROI '{roi}'. Skipping.")
+        # Skip if masks are not present or have mismatched shapes
+        if ck_mask is None or ngfr_mask is None or ck_mask.shape != ngfr_mask.shape:
             continue
         
         # Calculate areas
-        area_ck_pos = np.sum(ck_mask == 1) * pixel_area
-        area_ck_ngfr_pos = np.sum((ck_mask == 1) & (ngfr_mask == 1)) * pixel_area
-        total_area = ck_mask.size * pixel_area  # Total area in µm²
+        area_ck = np.sum(ck_mask == 1) * pixel_area
+        area_ckng = np.sum((ck_mask == 1) & (ngfr_mask == 1)) * pixel_area
+        total = ck_mask.size * pixel_area
         
         data.append({
             'ROI': roi,
-            'CK_Positive_Area_um2': area_ck_pos,
-            'CK_NGFR_Positive_Area_um2': area_ck_ngfr_pos,
-            'total_area_roi_um2': total_area
+            'CK_Positive_Area_um2': area_ck,
+            'CK_NGFR_Positive_Area_um2': area_ckng,
+            'total_area_roi_um2': total
         })
     
-    mask_area_summary = pd.DataFrame(data)
-    return mask_area_summary
+    return pd.DataFrame(data)
 
 
 def compute_subpop_cells_per_area(
-    df_binary,
-    subpop_conditions,
-    condition_column_map,
-    mask_area_summary,
-    selected_rois,
-    path_save,
-    roi_col='ROI'
-):
+    df_binary: pd.DataFrame, 
+    subpop_conditions: list, 
+    cond_map: dict, 
+    mask_summary: pd.DataFrame, 
+    rois: list, 
+    out_dir: str, 
+    roi_col: str = 'ROI'
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    For each specified ROI:
-      1) Filters the cells that meet ALL the 'subpop_conditions'.
-      2) Counts the total number of cells in this subpopulation.
-      3) Includes the CK⁺ and CK⁺NGFR⁺ areas from mask_area_summary.
-      4) Calculates the concentration of cells per square micrometer (cells/µm²) 
-         for CK⁺ and CK⁺NGFR⁺ areas.
-      5) Saves the formatted summary as a CSV file in the specified path.
-    
-    Additionally:
-      - Renames the 'Subpopulation Cell Count' column to reflect the actual subpopulation conditions.
-    
-    Parameters:
-    - df_binary (pd.DataFrame): DataFrame containing cell information.
-    - subpop_conditions (list of str): List of conditions, e.g., ["CD3_intensity+", "CD4_intensity+", "FOXP3_intensity+"].
-    - condition_column_map (dict): Mapping of condition names to column names in df_binary.
-    - mask_area_summary (pd.DataFrame): DataFrame containing area information per ROI.
-    - selected_rois (list of str): List of ROIs to process, e.g., ["roi8","roi13","roi11","roi5"].
-    - path_save (str): Directory path where the CSV will be saved, e.g., "..\\results_spatial_analysis\\user\\cell_density_area".
-    - roi_col (str): Name of the column in df_binary that indicates the ROI.
-    
+    Computes subpopulation cell counts and densities for each ROI.
+
+    Args:
+        df_binary (pd.DataFrame): Binary DataFrame where rows represent cells and columns represent markers.
+        subpop_conditions (list): List of conditions (e.g., markers) to define the subpopulation.
+        cond_map (dict): Mapping of condition names to corresponding column names in df_binary.
+        mask_summary (pd.DataFrame): DataFrame with area information for each ROI.
+        rois (list): List of ROIs to process.
+        out_dir (str): Directory to save the output CSV file.
+        roi_col (str, optional): Column name in df_binary indicating the ROI. Defaults to 'ROI'.
+
     Returns:
-    - summary_df (pd.DataFrame): Summary DataFrame with metrics per ROI.
-    - summary_formatted (pd.DataFrame): Formatted DataFrame for better readability.
+        tuple[pd.DataFrame, pd.DataFrame]: 
+            - summary_df: DataFrame with cell count and densities per ROI.
+            - summary_fmt: Formatted version of summary_df for saving as CSV.
     """
-    # 1. Parse the subpopulation conditions into a dictionary {column: value}
-    parsed_conditions = {}
+    parsed = {}
+    
+    # Parse conditions into binary column values
     for cond in subpop_conditions:
-        cond = cond.strip()
-        val = 1 if cond.endswith('+') else 0
-        base = cond[:-1].strip()
-        if base in condition_column_map:
-            col_name = condition_column_map[base]
-            parsed_conditions[col_name] = val
+        val = 1 if cond.strip().endswith('+') else 0
+        key = cond.strip()[:-1].strip()
+        col = cond_map.get(key)
+        
+        if col:
+            parsed[col] = val
         else:
-            print(f"Warning: No mapping for '{cond}' → ignoring.")
+            print(f"Warning: No mapping found for '{cond}' → skipping.")
+
+    # Lookup for areas by ROI
+    area_lookup = mask_summary.set_index('ROI')
+
+    # Filter df_binary by ROIs
+    df_filt = df_binary[df_binary[roi_col].isin(rois)]
+    missing = set(rois) - set(df_filt[roi_col].unique())
     
-    # 2. Create a lookup dictionary for areas per ROI
-    area_lookup = mask_area_summary.set_index('ROI')
-    
-    # 3. Filter df_binary to include only selected_rois
-    df_filtered = df_binary[df_binary[roi_col].isin(selected_rois)]
-    
-    # Check for ROIs in selected_rois not present in df_binary
-    missing_in_binary = set(selected_rois) - set(df_filtered[roi_col].unique())
-    if missing_in_binary:
-        print(f"Warning: The following ROIs are specified in selected_rois but not found in df_binary: {missing_in_binary}")
-    
-    # 4. Group the filtered df_binary by ROI
-    grouped = df_filtered.groupby(roi_col, dropna=False)
-    
+    if missing:
+        print(f"Warning: ROIs not found in df_binary: {missing}")
+
     results = []
-    
-    for roi, group_df in grouped:
-        # a. Check if the ROI exists in mask_area_summary
-        if roi not in area_lookup.index:
-            print(f"Warning: ROI '{roi}' not found in mask_area_summary. Skipping.")
+    for roi in rois:
+        grp = df_filt[df_filt[roi_col] == roi]
+        
+        # Skip if group is empty or ROI is not in area lookup
+        if grp.empty or roi not in area_lookup.index:
             continue
+
+        # Filter by subpopulation conditions
+        mask_sub = pd.Series(True, index=grp.index)
+        for col, val in parsed.items():
+            mask_sub &= (grp[col] == val)
         
-        # b. Filter the subpopulation that meets ALL conditions
-        mask_subpop = pd.Series([True] * len(group_df), index=group_df.index)
-        for bin_col, needed_val in parsed_conditions.items():
-            if bin_col in group_df.columns:
-                mask_subpop &= (group_df[bin_col] == needed_val)
-            else:
-                print(f"Warning: Column '{bin_col}' not found in df_binary for ROI '{roi}'.")
-                mask_subpop &= False  # If the column is not present, no match
-        
-        subpop_df = group_df[mask_subpop]
-        subpop_count = len(subpop_df)
-        
-        # c. Retrieve areas from mask_area_summary
-        area_ck = area_lookup.loc[roi, 'CK_Positive_Area_um2'] if 'CK_Positive_Area_um2' in area_lookup.columns else 0
-        area_ck_ngfr = area_lookup.loc[roi, 'CK_NGFR_Positive_Area_um2'] if 'CK_NGFR_Positive_Area_um2' in area_lookup.columns else 0
-        
-        # d. Calculate cell concentration per square micrometer for each specific area
-        cells_per_um2_ck = subpop_count / area_ck if area_ck > 0 else 0
-        cells_per_um2_ck_ngfr = subpop_count / area_ck_ngfr if area_ck_ngfr > 0 else 0
-        
-        # e. Add the results
+        cnt = mask_sub.sum()
+
+        # Get areas from the area lookup
+        area_ck = area_lookup.at[roi, 'CK_Positive_Area_um2']
+        area_ckng = area_lookup.at[roi, 'CK_NGFR_Positive_Area_um2']
+
+        # Calculate densities
+        dens_ck = cnt / area_ck if area_ck > 0 else 0
+        dens_ckng = cnt / area_ckng if area_ckng > 0 else 0
+
         results.append({
             'ROI': roi,
-            'Subpopulation_Cell_Count': subpop_count,
+            'Subpopulation_Cell_Count': cnt,
             'CK_Positive_Area_um2': area_ck,
-            'CK_NGFR_Positive_Area_um2': area_ck_ngfr,
-            'Cells_per_um2_CK_Positive': cells_per_um2_ck,        # Cells per µm² of CK⁺
-            'Cells_per_um2_CK_NGFR_Positive': cells_per_um2_ck_ngfr  # Cells per µm² of CK⁺NGFR⁺
+            'CK_NGFR_Positive_Area_um2': area_ckng,
+            'Cells_per_um2_CK_Positive': dens_ck,
+            'Cells_per_um2_CK_NGFR_Positive': dens_ckng
         })
-        
-        # f. Debugging information
-        print(f"ROI: {roi}")
-        print(f"Subpopulation Count: {subpop_count}")
-        print(f"CK⁺ Area (µm²): {area_ck}")
-        print(f"CK⁺NGFR⁺ Area (µm²): {area_ck_ngfr}")
-        print(f"Cells per µm² (CK⁺): {cells_per_um2_ck:.6f}")
-        print(f"Cells per µm² (CK⁺NGFR⁺): {cells_per_um2_ck_ngfr:.6f}")
-        print("-" * 50)
-    
-    # 5. Check for ROIs specified in selected_rois but missing in mask_area_summary
-    missing_in_mask = set(selected_rois) - set(area_lookup.index)
-    if missing_in_mask:
-        print(f"Warning: The following ROIs are specified in selected_rois but not found in mask_area_summary: {missing_in_mask}")
-    
-    # 6. Create the summary DataFrame
+
+    # Create summary DataFrame
     summary_df = pd.DataFrame(results)
-    
-    # 7. Format the DataFrame for better readability
-    summary_formatted = summary_df.copy()
-    
-    # Maintain precision in 'Cells_per_um2' without rounding
-    summary_formatted['Cells_per_um2_CK_Positive'] = summary_formatted['Cells_per_um2_CK_Positive'].apply(lambda x: f"{x:.6f}")
-    summary_formatted['Cells_per_um2_CK_NGFR_Positive'] = summary_formatted['Cells_per_um2_CK_NGFR_Positive'].apply(lambda x: f"{x:.6f}")
-    
-    # Format areas to two decimal places
-    summary_formatted['CK_Positive_Area_um2'] = summary_formatted['CK_Positive_Area_um2'].apply(lambda x: f"{x:.2f}")
-    summary_formatted['CK_NGFR_Positive_Area_um2'] = summary_formatted['CK_NGFR_Positive_Area_um2'].apply(lambda x: f"{x:.2f}")
-    
-    # 8. Generate dynamic label for Subpopulation
-    # Join the subpop_conditions with underscores and replace '+' with 'Pos' to make it filename-friendly
-    safe_subpop_label = "_".join([cond.replace("+", "Pos").replace(" ", "") for cond in subpop_conditions])
-    
-    # 9. Rename columns for clarity, including dynamic subpopulation label
-    summary_formatted.rename(columns={
-        'Subpopulation_Cell_Count': f'Subpopulation Cell Count ({", ".join(subpop_conditions)})',
+
+    # Format for saving
+    summary_fmt = summary_df.copy()
+    summary_fmt['Cells_per_um2_CK_Positive'] = summary_fmt['Cells_per_um2_CK_Positive'].map(lambda x: f"{x:.6f}")
+    summary_fmt['Cells_per_um2_CK_NGFR_Positive'] = summary_fmt['Cells_per_um2_CK_NGFR_Positive'].map(lambda x: f"{x:.6f}")
+    summary_fmt['CK_Positive_Area_um2'] = summary_fmt['CK_Positive_Area_um2'].map(lambda x: f"{x:.2f}")
+    summary_fmt['CK_NGFR_Positive_Area_um2'] = summary_fmt['CK_NGFR_Positive_Area_um2'].map(lambda x: f"{x:.2f}")
+
+    # Rename columns dynamically based on conditions
+    label = "_".join([c.replace("+", "Pos").replace(" ", "") for c in subpop_conditions])
+    summary_fmt.rename(columns={
+        'Subpopulation_Cell_Count': f"Subpopulation Cell Count ({', '.join(subpop_conditions)})",
         'CK_Positive_Area_um2': 'CK⁺ Area (µm²)',
         'CK_NGFR_Positive_Area_um2': 'CK⁺NGFR⁺ Area (µm²)',
         'Cells_per_um2_CK_Positive': 'Cells per µm² (CK⁺)',
         'Cells_per_um2_CK_NGFR_Positive': 'Cells per µm² (CK⁺NGFR⁺)'
     }, inplace=True)
-    
-    # 10. Ensure the save directory exists
-    os.makedirs(path_save, exist_ok=True)
-    
-    # 11. Construct an appropriate CSV filename without datetime
-    # For example: 'cell_density_area_CD3_intensityPos_CD4_intensityPos_FOXP3_intensityPos.csv'
-    csv_filename = f"cell_density_area_{safe_subpop_label}.csv"
-    csv_path = os.path.join(path_save, csv_filename)
-    
-    # 12. Save the formatted summary as CSV
-    summary_formatted.to_csv(csv_path, index=False)
-    print(f"\nFormatted summary saved as CSV at: {csv_path}")
-    
-    # 13. Display the formatted DataFrame
-    print("\nFormatted Summary DataFrame:")
-    print(summary_formatted)
-    
-    return summary_df, summary_formatted  # Return both for flexibility
-def compute_distances(sub_df, mask, bin_col):
-    """
-    Returns two lists:
-        dist_to_pos, dist_to_neg   (µm)
-    """
-    pos_pts = np.column_stack(np.where(mask == 1))
-    neg_pts = np.column_stack(np.where(mask == 0))
-    tree_pos = cKDTree(pos_pts) if len(pos_pts) else None
-    tree_neg = cKDTree(neg_pts) if len(neg_pts) else None
 
-    d_pos, d_neg = [], []
+    # Save the formatted DataFrame to CSV
+    os.makedirs(out_dir, exist_ok=True)
+    csv_path = os.path.join(out_dir, f"cell_density_area_{label}.csv")
+    summary_fmt.to_csv(csv_path, index=False)
+    print(f"Saved: {csv_path}")
+
+    return summary_df, summary_fmt
+
+
+def compute_distances(sub_df: pd.DataFrame, mask: np.ndarray, bin_col: str) -> tuple[list, list]:
+    """
+    Computes the distances from each cell's centroid to the positive and negative regions of a mask.
+
+    Args:
+        sub_df (pd.DataFrame): DataFrame with cell centroids and binary values.
+        mask (np.ndarray): Binary mask where 1 represents the positive region and 0 represents the negative region.
+        bin_col (str): Column name in sub_df representing the binary condition.
+
+    Returns:
+        tuple[list, list]: Two lists containing distances to positive and negative regions in micrometers.
+    """
+    pos = np.column_stack(np.where(mask == 1))
+    neg = np.column_stack(np.where(mask == 0))
+    
+    tree_p = cKDTree(pos) if len(pos) else None
+    tree_n = cKDTree(neg) if len(neg) else None
+    
+    d_to_pos, d_to_neg = [], []
     for _, r in sub_df.iterrows():
-        centroid = (r['centroid_row'], r['centroid_col'])
-        if r[bin_col] == 1:  # marker+
-            dist = tree_neg.query(centroid)[0] if tree_neg else 0.0
-            d_pos.append(0.0)
-            d_neg.append(dist * PIXEL_SIZE)
-        else:                # marker‑
-            dist = tree_pos.query(centroid)[0] if tree_pos else 0.0
-            d_pos.append(dist * PIXEL_SIZE)
-            d_neg.append(0.0)
-    return d_pos, d_neg
-def get_centroids(dapi_mask):
+        cent = (r['centroid_row'], r['centroid_col'])
+        if r.get(bin_col, 0) == 1:
+            d_to_pos.append(0.0)
+            d_to_neg.append(tree_n.query(cent)[0] * PIXEL_SIZE if tree_n else 0.0)
+        else:
+            d_to_pos.append(tree_p.query(cent)[0] * PIXEL_SIZE if tree_p else 0.0)
+            d_to_neg.append(0.0)
+    
+    return d_to_pos, d_to_neg
+
+
+def get_centroids(dapi_mask: np.ndarray) -> pd.DataFrame:
     """
-    Extracts centroids (row, col) from the labeled DAPI mask.
-    Returns a DataFrame with DAPI_ID, centroid_row, centroid_col.
+    Extracts centroids from a labeled DAPI mask.
+
+    Args:
+        dapi_mask (np.ndarray): Labeled DAPI mask.
+
+    Returns:
+        pd.DataFrame: DataFrame with columns ['DAPI_ID', 'centroid_row', 'centroid_col'].
     """
-    props = regionprops(dapi_mask)
     data = []
-    for prop in props:
-        data.append({
-            'DAPI_ID': prop.label,
-            'centroid_row': int(prop.centroid[0]),
-            'centroid_col': int(prop.centroid[1])
-        })
+    for p in regionprops(dapi_mask):
+        r, c = p.centroid
+        data.append({'DAPI_ID': p.label, 'centroid_row': int(r), 'centroid_col': int(c)})
     return pd.DataFrame(data)
 
 
-
-
-def compute_subpop_distances(subpopA_df, subpopB_df):
+def compute_subpop_distances(subpopA_df: pd.DataFrame, subpopB_df: pd.DataFrame) -> pd.DataFrame:
     """
-    For each cell in A and each cell in B, creates all A–B pairs and computes
-    the distance in pixels. Returns a DataFrame with all pairwise distances (no NaN).
+    Computes pairwise distances (pixels) between centroids of two subpopulations.
+
+    Args:
+        subpopA_df (pd.DataFrame): DataFrame with centroids of subpopulation A.
+        subpopB_df (pd.DataFrame): DataFrame with centroids of subpopulation B.
+
+    Returns:
+        pd.DataFrame: DataFrame with pairwise distances between centroids.
     """
-    if len(subpopA_df) == 0 or len(subpopB_df) == 0:
-        return pd.DataFrame()  # Nothing to compute
+    if subpopA_df.empty or subpopB_df.empty:
+        return pd.DataFrame()
 
-    # Cartesian product: B x A
-    cartesian_df = subpopB_df.assign(key=1).merge(
-        subpopA_df.assign(key=1),
-        on='key',
-        suffixes=('_b', '_a')
-    ).drop('key', axis=1)
-
-    # Compute distance for each pair
-    cartesian_df['distance_px'] = np.sqrt(
-        (cartesian_df['centroid_row_b'] - cartesian_df['centroid_row_a'])**2 +
-        (cartesian_df['centroid_col_b'] - cartesian_df['centroid_col_a'])**2
-    )
-
-    # Rename columns for consistency
-    result = cartesian_df[[
-        'DAPI_ID_b', 'centroid_row_b', 'centroid_col_b',
-        'DAPI_ID_a', 'centroid_row_a', 'centroid_col_a', 'distance_px'
-    ]]
-    result.columns = [
-        'B_cell_id', 'B_row', 'B_col',
-        'A_cell_id', 'A_row', 'A_col', 'distance_px'
-    ]
-
-    return result
+    A = subpopA_df.assign(key=1)
+    B = subpopB_df.assign(key=1)
+    df = pd.merge(B, A, on='key', suffixes=('_b', '_a')).drop('key', axis=1)
+    df['distance_px'] = np.sqrt((df['centroid_row_b'] - df['centroid_row_a'])**2 + 
+                                (df['centroid_col_b'] - df['centroid_col_a'])**2)
+    
+    return df.rename(columns={
+        'DAPI_ID_b': 'B_cell_id', 'centroid_row_b': 'B_row', 'centroid_col_b': 'B_col',
+        'DAPI_ID_a': 'A_cell_id', 'centroid_row_a': 'A_row', 'centroid_col_a': 'A_col'
+    })

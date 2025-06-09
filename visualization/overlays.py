@@ -1,42 +1,37 @@
-
 import random
-
-from scipy.spatial import cKDTree, KDTree, Voronoi
-from skimage.measure import regionprops, find_contours
-from skimage.color import label2rgb
-
-from shapely.geometry import Polygon as ShapelyPolygon
-
-from matplotlib.colors import Normalize
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, Normalize
 from matplotlib import cm
 from matplotlib.cm import ScalarMappable
 from matplotlib.patches import Polygon, Patch
 import matplotlib.patches as patches
-
 from matplotlib.collections import PatchCollection
 import matplotlib.lines as mlines
+from scipy.spatial import cKDTree, KDTree, Voronoi
+from skimage.measure import regionprops, find_contours
+from skimage.color import label2rgb
+from shapely.geometry import Polygon as ShapelyPolygon
+from typing import List, Dict, Optional, Tuple
 
-# Constantes que usas pero no defines aquí:
-from multiplex_pipeline.config import PIXEL_SIZE, MASK_ALPHA
-
-# Funciones auxiliares que también debes importar si no están en este mismo módulo:
+# Constants
+from multiplex_pipeline.config import PIXEL_SIZE, MASK_ALPHA, CNIO_USER
 from multiplex_pipeline.analysis.spatial import (
-    compute_distances,
-    get_centroids,
-    compute_subpop_distances
+    compute_distances, get_centroids, compute_subpop_distances
 )
 
-from multiplex_pipeline.config import CNIO_USER
-import pandas as pd 
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
-import os
-
-def parse_conditions(cond_list, col_map):
+def parse_conditions(cond_list: List[str], col_map: Dict[str, str]) -> Dict[str, int]:
     """
-    Converts strings like 'CK_mask+' into
-    {'is_positive_Pan_Cytokeratin_CK_binary': 1}
+    Converts conditions like 'CK_mask+' into {'is_positive_Pan_Cytokeratin_CK_binary': 1}.
+    
+    Args:
+        cond_list (List[str]): List of conditions in string format (e.g., 'CK_mask+', 'NGFR_mask-').
+        col_map (Dict[str, str]): A mapping from condition names to column names in the dataframe.
+    
+    Returns:
+        Dict[str, int]: A dictionary where keys are column names and values are 1 or 0 based on condition.
     """
     parsed = {}
     for c in (cond.strip() for cond in cond_list):
@@ -53,8 +48,17 @@ def parse_conditions(cond_list, col_map):
             print(f"No mapping for '{c}'.")
     return parsed
 
-def select_subpopulation(df, parsed):
-    """AND‑filter dataframe with parsed condition dict."""
+def select_subpopulation(df: pd.DataFrame, parsed: Dict[str, int]) -> pd.DataFrame:
+    """
+    Filters the dataframe based on the parsed conditions.
+    
+    Args:
+        df (pd.DataFrame): The dataframe to filter.
+        parsed (Dict[str, int]): A dictionary containing the conditions to apply on the dataframe columns.
+    
+    Returns:
+        pd.DataFrame: A dataframe filtered by the parsed conditions.
+    """
     if not parsed:
         return df.iloc[0:0]
     mask = pd.Series(True, index=df.index)
@@ -62,41 +66,42 @@ def select_subpopulation(df, parsed):
         mask &= (df[col] == val) if col in df else False
     return df[mask]
 
-def create_color_composite(img_data, mask_dicts, markers_to_plot, roi_lower, brightness_factor=1.0):
+def create_color_composite(img_data: np.ndarray, mask_dicts: Dict[str, Dict[str, np.ndarray]], 
+                           markers_to_plot: List[Tuple[str, Optional[int]]], roi_lower: str, 
+                           brightness_factor: float = 1.0) -> np.ndarray:
     """
-    Crea una composición aditiva multicanal, asignando colores distintos a cada canal y máscara.
+    Create an additive multi-channel composite by assigning distinct colors to each channel and mask.
     
-    Parámetros:
-    - img_data: array de numpy con forma (num_channels, height, width)
-    - mask_dicts: diccionario que contiene las máscaras disponibles (ej. {'CK_mask': ck_masks_dict, ...})
-    - markers_to_plot: lista de tuplas (nombre_marcador, índice_canal o None)
-    - roi_lower: string, nombre de la ROI en minúsculas
-    - brightness_factor: factor de ajuste de brillo
+    Args:
+        img_data (np.ndarray): Image data with shape (num_channels, height, width).
+        mask_dicts (Dict[str, Dict[str, np.ndarray]]): Dictionary containing available masks.
+        markers_to_plot (List[Tuple[str, Optional[int]]]): List of tuples (marker_name, channel_index or None).
+        roi_lower (str): The lowercase name of the ROI.
+        brightness_factor (float, optional): Factor to adjust brightness, default is 1.0.
     
-    Retorna:
-    - composite: array de numpy con forma (height, width, 3) representando la mezcla aditiva
+    Returns:
+        np.ndarray: The resulting RGB composite image.
     """
     height, width = img_data.shape[1], img_data.shape[2]
     composite = np.zeros((height, width, 3), dtype=np.float32)
 
-    # Lista de colores base (Rojo, Verde, Azul, Magenta, Cian, Amarillo, etc.)
+    # Base colors (red, green, blue, magenta, cyan, yellow, etc.)
     base_colors = np.array([
-        [1, 0, 0],      # Rojo
-        [0, 1, 0],      # Verde
-        [0, 0, 1],      # Azul
-        [1, 0, 1],      # Magenta
-        [0, 1, 1],      # Cian
-        [1, 1, 0],      # Amarillo
-        [0.5, 0.5, 0],  # Oliva
-        [0.5, 0, 0.5],  # Púrpura
+        [1, 0, 0],  # Red
+        [0, 1, 0],  # Green
+        [0, 0, 1],  # Blue
+        [1, 0, 1],  # Magenta
+        [0, 1, 1],  # Cyan
+        [1, 1, 0],  # Yellow
+        [0.5, 0.5, 0],  # Olive
+        [0.5, 0, 0.5],  # Purple
         [0, 0.5, 0.5],  # Teal
     ], dtype=np.float32)
 
     for i, (marker_name, ch) in enumerate(markers_to_plot):
-        color = base_colors[i % len(base_colors)]  # Asigna color único
-
+        color = base_colors[i % len(base_colors)]  # Assign a unique color
         if ch is not None:
-            # Es un canal de intensidad
+            # Intensity channel
             channel_data = img_data[ch, :, :] * brightness_factor
             cmin, cmax = channel_data.min(), channel_data.max()
             if cmax == cmin:
@@ -106,49 +111,54 @@ def create_color_composite(img_data, mask_dicts, markers_to_plot, roi_lower, bri
             gamma = 0.5
             channel_gamma_corrected = channel_norm ** gamma
 
-            # Suma aditiva al composite en cada canal RGB
+            # Add to composite
             composite[:, :, 0] += channel_gamma_corrected * color[0]
             composite[:, :, 1] += channel_gamma_corrected * color[1]
             composite[:, :, 2] += channel_gamma_corrected * color[2]
         else:
-            # Es una máscara
+            # Mask
             mask_data = None
             if marker_name in mask_dicts and roi_lower in mask_dicts[marker_name]:
                 mask_data = mask_dicts[marker_name][roi_lower]
             if mask_data is not None:
-                # Asegurarse de que la máscara es binaria
+                # Ensure binary mask
                 mask_binary = (mask_data > 0).astype(float)
                 composite[:, :, 0] += mask_binary * color[0]
                 composite[:, :, 1] += mask_binary * color[1]
                 composite[:, :, 2] += mask_binary * color[2]
-            else:
-               
-                pass
 
-    # Limitar valores para evitar que excedan 1
+    # Clip values to avoid exceeding 1
     composite = np.clip(composite, 0, 1)
     return composite
 
 def plot_conditional_cells_channels(
-    rois, 
-    conditions, 
-    dapi_masks_dict, 
-    images_dict, 
-    df_binary, 
-    marker_dict, 
-    ck_masks_dict, 
-    ngfr_masks_dict, 
-    condition_column_map, 
-    brightness_factor=1.0
-    ):
-    def is_mask_marker(name):
+    rois: List[str], conditions: List[str], dapi_masks_dict: Dict[str, np.ndarray], 
+    images_dict: Dict[str, np.ndarray], df_binary: pd.DataFrame, marker_dict: Dict[str, str], 
+    ck_masks_dict: Dict[str, Dict[str, np.ndarray]], ngfr_masks_dict: Dict[str, Dict[str, np.ndarray]], 
+    condition_column_map: Dict[str, str], brightness_factor: float = 1.0) -> None:
+    """
+    Plot cells and channels for the specified conditions in each ROI.
+    
+    Args:
+        rois (List[str]): List of ROIs to process.
+        conditions (List[str]): List of conditions to apply to the cells.
+        dapi_masks_dict (Dict[str, np.ndarray]): Dictionary of DAPI masks for each ROI.
+        images_dict (Dict[str, np.ndarray]): Dictionary of images for each ROI.
+        df_binary (pd.DataFrame): Binary dataframe with cell information.
+        marker_dict (Dict[str, str]): Mapping of markers to channel indices.
+        ck_masks_dict (Dict[str, Dict[str, np.ndarray]]): CK masks dictionary.
+        ngfr_masks_dict (Dict[str, Dict[str, np.ndarray]]): NGFR masks dictionary.
+        condition_column_map (Dict[str, str]): Mapping from condition names to dataframe columns.
+        brightness_factor (float, optional): Factor to adjust brightness of intensity channels, default is 1.0.
+    """
+    def is_mask_marker(name: str) -> bool:
         return name.lower().endswith('_mask')
 
-    def is_intensity_marker(name):
+    def is_intensity_marker(name: str) -> bool:
         return name.lower().endswith('_intensity')
 
-    def get_channel_for_marker(marker_short):
-        """Devuelve el índice de canal si es *_intensity; None si es *_mask."""
+    def get_channel_for_marker(marker_short: str) -> Optional[int]:
+        """Returns the channel index if the marker is intensity; None if it's a mask."""
         if is_mask_marker(marker_short):
             return None
         base_name = marker_short.replace('_intensity', '').strip()
@@ -159,38 +169,16 @@ def plot_conditional_cells_channels(
         print(f"Channel not found for marker '{marker_short}'")
         return None
 
-    def parse_conditions(conditions, condition_column_map):
-        """Returns un dict con { binary_column: value (1 o 0), ... }"""
-        parsed = {}
-        for cond in conditions:
-            if cond.endswith('+'):
-                shorthand = cond[:-1]
-                val = 1
-            elif cond.endswith('-'):
-                shorthand = cond[:-1]
-                val = 0
-            else:
-                print(f"Formato de condición desconocido: {cond}. Debe terminar en '+' o '-'.")
-                continue
-
-            if shorthand in condition_column_map:
-                marker_col = condition_column_map[shorthand]
-                parsed[marker_col] = val
-            else:
-                print(f"No se encontró mapeo para la condición {shorthand}")
-        return parsed
-
     parsed_conditions = parse_conditions(conditions, condition_column_map)
 
-    # Preparamos la lista de marcadores (tuplas) a mostrar
+    # Prepare the list of markers to display
     markers_to_plot = []
     mask_dicts_combined = {
         'CK_mask': ck_masks_dict,
         'NGFR_mask': ngfr_masks_dict,
     }
     for cond in conditions:
-        # Por ej. cond = 'CK_mask+', 'CD3_intensity+', etc.
-        shorthand = cond[:-1]  # quita el + o -
+        shorthand = cond[:-1]  # Remove the '+' or '-'
         ch = get_channel_for_marker(shorthand)
         markers_to_plot.append((shorthand, ch))
 
@@ -200,55 +188,52 @@ def plot_conditional_cells_channels(
         roi_dapi_key = f"{roi_lower}_dapi"
 
         if roi_dapi_key not in dapi_masks_dict:
-            print(f"Warning: {roi_dapi_key} no se encuentra en dapi_masks_dict. Saltando...")
+            print(f"Warning: {roi_dapi_key} not found in dapi_masks_dict. Skipping...")
             continue
 
-        # Buscar la clave en images_dict que contenga el ROI
         roi_image_key = None
         for key in images_dict.keys():
             if roi_lower in key.lower():
                 roi_image_key = key
                 break
         if roi_image_key is None:
-            print(f"No se encontró imagen en images_dict para {roi}")
+            print(f"No image found for {roi} in images_dict")
             continue
 
-        img_data = images_dict[roi_image_key]  # shape (channels, height, width)
+        img_data = images_dict[roi_image_key]  # Shape (channels, height, width)
         cell_mask = dapi_masks_dict[roi_dapi_key]
         df_roi = df_binary[df_binary['ROI'] == roi]
 
-        # Determinar celdas que cumplen TODAS las condiciones
-        condition_series = pd.Series([True]*len(df_roi), index=df_roi.index)
+        # Determine cells that meet all conditions
+        condition_series = pd.Series([True] * len(df_roi), index=df_roi.index)
         for marker_col, val in parsed_conditions.items():
             condition_series &= (df_roi[marker_col] == val)
 
         selected_cells = df_roi[condition_series]['DAPI_ID'].tolist()
-        print(f"ROI {roi}: {len(selected_cells)} celdas cumplen {conditions}")
+        print(f"ROI {roi}: {len(selected_cells)} cells meet the conditions")
 
         mask_selected = np.isin(cell_mask, selected_cells).astype(int) if selected_cells else np.zeros_like(cell_mask, dtype=int)
 
         n_markers = len(markers_to_plot)
         n_cols = n_markers + 2
-        
-        fig = plt.figure(figsize=(6*n_cols, 12))
-        
-        # Generar un colormap aleatorio para las células (igual que antes)
+
+        fig = plt.figure(figsize=(6 * n_cols, 12))
+
+        # Generate a random colormap for the cells (same as before)
         cell_labels = np.unique(cell_mask)
         cell_labels = cell_labels[cell_labels != 0]
         num_labels = len(cell_labels) + 1
         np.random.seed(42)
         rand_colors = np.random.rand(num_labels, 3)
-        rand_colors[0] = [0, 0, 0] 
+        rand_colors[0] = [0, 0, 0]  # Background (label 0) is black
         cmap_cells = ListedColormap(rand_colors)
-        
-        # --------------------------------------
-        # Listas donde guardaremos cada imagen de la fila
+
+        # Top and bottom image lists
         top_images = [None] * n_cols
         bottom_images = [None] * n_cols
-        # --------------------------------------
-        
-        # ==================== FILA SUPERIOR ====================
-        # (1) Columna 1 (arriba): composite multicolor
+
+        # ==================== TOP ROW ====================
+        # Column 1: multicolor composite
         ax_top_left = plt.subplot(2, n_cols, 1)
         composite = create_color_composite(
             img_data, 
@@ -260,13 +245,12 @@ def plot_conditional_cells_channels(
         ax_top_left.imshow(composite, interpolation='nearest')
         ax_top_left.set_title('Multicolor Composite\n(Intensity + Masks)')
         ax_top_left.axis('off')
-        top_images[0] = composite  # almacenamos la composite en la posición 0
+        top_images[0] = composite
         
-        # (2) Columnas 2..(n_markers+1), fila superior: canales individuales
+        # Columns 2 to n_markers+1: individual channels
         for i, (marker_name, ch) in enumerate(markers_to_plot, start=2):
             ax_top = plt.subplot(2, n_cols, i)
             if is_mask_marker(marker_name):
-                # Plot de la máscara
                 if marker_name in mask_dicts_combined and roi_lower in mask_dicts_combined[marker_name]:
                     mask_img = mask_dicts_combined[marker_name][roi_lower]
                     ax_top.imshow(mask_img, cmap='gray')
@@ -276,9 +260,8 @@ def plot_conditional_cells_channels(
                     ax_top.imshow(zeros_img, cmap='gray')
                     top_images[i-1] = zeros_img
                 ax_top.set_title(f'Mask: {marker_name}')
-        
+
             elif is_intensity_marker(marker_name):
-                # Plot del canal intensidad
                 if ch is not None:
                     channel_data = img_data[ch, :, :] * brightness_factor
                     cmin, cmax = channel_data.min(), channel_data.max()
@@ -296,78 +279,64 @@ def plot_conditional_cells_channels(
                     top_images[i-1] = zeros_img
                 ax_top.set_title(f'Intensity: {marker_name}')
             else:
-                # Caso no manejado
                 zeros_img = np.zeros_like(cell_mask, dtype=float)
                 ax_top.imshow(zeros_img, cmap='gray')
                 top_images[i-1] = zeros_img
                 ax_top.set_title(f'?? {marker_name}')
-        
+
             ax_top.axis('off')
-        
-        # (3) Columna n_markers+2, fila superior: AQUI HACEMOS LA MEDIA
+
+        # Last column: average of the images from 2..n_markers
         ax_top_right = plt.subplot(2, n_cols, n_markers + 2)
-        # Calculamos la media de las imágenes de las columnas 2..(n_markers+1),
-        # o sea, indices 1..n_markers en top_images (excluimos la 0, que es el composite).
-        imgs_for_average_top = [top_images[idx] for idx in range(1, n_markers+1)]
-        # Verificamos que sean 2D todas (en caso de que alguna fuera RGB, puede requerir adaptación).
+        imgs_for_average_top = [top_images[idx] for idx in range(1, n_markers + 1)]
         avg_top = np.mean(imgs_for_average_top, axis=0)
-        
         ax_top_right.imshow(avg_top, cmap='gray')
-        ax_top_right.set_title('Media (Fila Superior)')
+        ax_top_right.set_title('Mean (Top Row)')
         ax_top_right.axis('off')
-        top_images[n_markers+1] = avg_top  # Guardamos la imagen final por si se usa después
-        
-        # ==================== FILA INFERIOR ====================
-        # (4) Columna 1 (abajo): composite + TODAS las células
+        top_images[n_markers + 1] = avg_top
+
+        # ==================== BOTTOM ROW ====================
+        # Column 1: composite with all cells
         ax_bottom_left = plt.subplot(2, n_cols, n_cols + 1)
-        composite_2x = np.clip(top_images[0] * 2, 0, 1)  # duplicamos brillo de la composite
+        composite_2x = np.clip(top_images[0] * 2, 0, 1)  # Double the brightness
         ax_bottom_left.imshow(composite_2x, interpolation='nearest') 
         ax_bottom_left.imshow(cell_mask, cmap=cmap_cells, alpha=0.5, interpolation='nearest')
-        ax_bottom_left.set_title('All Cells (sobre Composite)')
+        ax_bottom_left.set_title('All Cells (over Composite)')
         ax_bottom_left.axis('off')
         bottom_images[0] = composite_2x
         
-        # (5) Columnas 2..(n_markers+1) (abajo): el mismo canal/máscara, pero con brillo x2
+        # Columns 2 to n_markers+1: individual channels/masks with doubled brightness
         for j, (marker_name, _) in enumerate(markers_to_plot, start=2):
             ax_bottom = plt.subplot(2, n_cols, n_cols + j)
-            fondo = top_images[j-1]  # la imagen que habíamos guardado arriba
-            fondo_2x = np.clip(fondo * 2, 0, 1)  # duplicamos brillo
-            bottom_images[j-1] = fondo_2x  # guardamos esta versión en la lista bottom_images
-        
+            fondo = top_images[j - 1]
+            fondo_2x = np.clip(fondo * 2, 0, 1)  # Double brightness
+            bottom_images[j - 1] = fondo_2x
             ax_bottom.imshow(fondo_2x, cmap='gray')
-            # Overlay: celdas positivas para el marcador
+
+            # Overlay positive cells for the marker
             col_bin = condition_column_map.get(marker_name)
             if col_bin is not None:
-                # Aquí consultamos si hay un valor (0 o 1) definido para este marcador en parsed_conditions
                 val = parsed_conditions.get(col_bin, None)
                 if val is not None:
-                    # Muestra celdas == val (si val = 1 → positivas, si val = 0 → negativas)
                     selected_cells_for_marker = df_roi[df_roi[col_bin] == val]['DAPI_ID'].tolist()
                 else:
-                    # Si el marcador no está en las condiciones, decide por defecto (por ej. siempre 1)
                     selected_cells_for_marker = df_roi[df_roi[col_bin] == 1]['DAPI_ID'].tolist()
             else:
                 selected_cells_for_marker = []
             
             mask_positive = np.isin(cell_mask, selected_cells_for_marker).astype(int)
             ax_bottom.imshow(mask_positive * cell_mask, cmap=cmap_cells, interpolation='nearest', alpha=0.5)
-
-        
-            ax_bottom.imshow(mask_positive * cell_mask, cmap=cmap_cells, interpolation='nearest', alpha=0.5)
             ax_bottom.set_title(f'Pos Cells\n{marker_name}')
             ax_bottom.axis('off')
-        
-        # (6) Columna n_markers+2, fila inferior: AQUI TAMBIÉN HACEMOS LA MEDIA
-        ax_bottom_right = plt.subplot(2, n_cols, 2*n_cols)
-        # Calculamos la media de las columnas 2..(n_markers+1) en la fila inferior,
-        # que son indices 1..n_markers en bottom_images (excluyendo el 0 que es composite_2x).
-        imgs_for_average_bottom = [bottom_images[idx] for idx in range(1, n_markers+1)]
+
+        # Last column: average of the bottom row images
+        ax_bottom_right = plt.subplot(2, n_cols, 2 * n_cols)
+        imgs_for_average_bottom = [bottom_images[idx] for idx in range(1, n_markers + 1)]
         avg_bottom = np.mean(imgs_for_average_bottom, axis=0)
-        # Mostramos esa media (si quieres aplicarle x2 adicional, podrías hacerlo, pero aquí ya está “iluminada”).
         ax_bottom_right.imshow(avg_bottom, cmap='gray')  
-        
+
         if selected_cells:
-            # Celdas finales
+            # Final cells
             cmap_selected = ListedColormap(['black'] + [np.random.rand(3,) for _ in range(len(selected_cells))])
             ax_bottom_right.imshow(mask_selected * cell_mask, cmap=cmap_selected, interpolation='nearest', alpha=0.7)
             ax_bottom_right.set_title(f'Final Filter:\n{conditions}')
@@ -376,11 +345,11 @@ def plot_conditional_cells_channels(
             ax_bottom_right.set_title(f'Final Filter (0)\n{conditions}')
         
         ax_bottom_right.axis('off')
-        bottom_images[n_markers+1] = avg_bottom  # por si lo necesitas más adelante
+        bottom_images[n_markers + 1] = avg_bottom
         
         plt.tight_layout()
         plt.show()
-        print(f"Plot generado para {roi}.")
+        print(f"Plot generated for {roi}.")
 
 
 def create_marker_plot(
@@ -1131,4 +1100,3 @@ def compute_and_plot_subpop_distances_for_all_rois(
             print(f"One or both subpopulations are empty in {roi}. No plot.")
 
     return all_distances
-
