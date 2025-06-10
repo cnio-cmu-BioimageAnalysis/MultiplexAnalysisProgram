@@ -188,7 +188,7 @@ def create_channel_masks(
         images_dict (Dict[str, np.ndarray]): A dictionary of images.
         dapi_masks_dict (Dict[str, np.ndarray]): A dictionary of DAPI masks.
         channel_index (int): The index of the channel to process.
-        user_scores (Union[Dict[str, float], float]): The score to use for thresholding.
+        user_scores (Union[Dict[str, float], float]): The score to use for thresholding. [0-3] mu + x*sigma = threshold
         scaling_divisor (float): A scaling factor for thresholding.
         base_folder_path (str): The base folder to save the masks.
         min_size (int): The minimum size of objects to keep.

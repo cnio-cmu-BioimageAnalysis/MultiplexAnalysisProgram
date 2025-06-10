@@ -48,7 +48,6 @@ def load_ome_tif_images(
         try:
             img = imread(path)
             images[path.name] = img
-            break
             
         except Exception as e:
             print(f"Error loading {path.name}: {e}")
@@ -84,9 +83,6 @@ def load_dapi_masks(
             continue
         key = f"roi{m.group(1)}_dapi"
         
-        # Only load ROI1 for testing purposes
-        if key.lower() != 'roi1_dapi':
-            continue
         
         try:
             masks[key] = imageio.imread(path)
