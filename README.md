@@ -121,7 +121,7 @@ The results will be saved in the **`./results/`** directory, where you will find
 
 If you use this tool in your research, please cite the following publication:
 
-**Daniel Anchuela**. _Design and Implementation of a Spatial Biology Image‑Analysis Tool for Multiplex Microscopy_. [Thesis Link/DOI] (2025).
+**Daniel Anchuela**. _Design and Implementation of a Spatial Biology Image‑Analysis Tool for Multiplex Microscopy_. (2025).
 
 ---
 
